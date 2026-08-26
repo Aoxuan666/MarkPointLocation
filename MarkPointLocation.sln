@@ -1,0 +1,27 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.28701.123
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Seprays.MarkVision", "src\Seprays.MarkVision\Seprays.MarkVision.csproj", "{8B0521AE-496F-41A2-8F53-8A02D709A659}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Seprays.MarkVision.Demo", "demo\Seprays.MarkVision.Demo\Seprays.MarkVision.Demo.csproj", "{93365AB7-6040-4A2F-A32E-E471FD924C2F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{8B0521AE-496F-41A2-8F53-8A02D709A659}.Debug|x64.ActiveCfg = Debug|x64
+		{8B0521AE-496F-41A2-8F53-8A02D709A659}.Debug|x64.Build.0 = Debug|x64
+		{8B0521AE-496F-41A2-8F53-8A02D709A659}.Release|x64.ActiveCfg = Release|x64
+		{8B0521AE-496F-41A2-8F53-8A02D709A659}.Release|x64.Build.0 = Release|x64
+		{93365AB7-6040-4A2F-A32E-E471FD924C2F}.Debug|x64.ActiveCfg = Debug|x64
+		{93365AB7-6040-4A2F-A32E-E471FD924C2F}.Debug|x64.Build.0 = Debug|x64
+		{93365AB7-6040-4A2F-A32E-E471FD924C2F}.Release|x64.ActiveCfg = Release|x64
+		{93365AB7-6040-4A2F-A32E-E471FD924C2F}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

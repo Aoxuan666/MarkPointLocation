@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x64</Platform>
+    <ProjectGuid>{8B0521AE-496F-41A2-8F53-8A02D709A659}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Seprays.MarkVision</RootNamespace>
+    <AssemblyName>Seprays.MarkVision</AssemblyName>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <LangVersion>7.3</LangVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x64' ">
+    <DebugSymbols>true</DebugSymbols><DebugType>full</DebugType><Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath><DefineConstants>DEBUG;TRACE</DefineConstants>
+    <DocumentationFile>bin\Debug\Seprays.MarkVision.xml</DocumentationFile><NoWarn>$(NoWarn);1591</NoWarn>
+    <PlatformTarget>x64</PlatformTarget><Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x64' ">
+    <DebugType>pdbonly</DebugType><Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath><DefineConstants>TRACE</DefineConstants>
+    <DocumentationFile>bin\Release\Seprays.MarkVision.xml</DocumentationFile><NoWarn>$(NoWarn);1591</NoWarn>
+    <PlatformTarget>x64</PlatformTarget><Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" /><Reference Include="System.Core" />
+    <Reference Include="System.Drawing" /><Reference Include="System.Runtime.Serialization" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="halcondotnet"><HintPath>Lib\halcondotnet.dll</HintPath><Private>True</Private></Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="SafeSources\MaskImageCanvasImpl.cs"><SubType>Component</SubType></Compile>
+    <Compile Include="SafeSources\MarkSetupControlImpl.cs"><SubType>UserControl</SubType></Compile>
+    <Compile Include="SafeSources\MarkSetupFormImpl.cs"><SubType>Form</SubType></Compile>
+    <Compile Include="SafeSources\CanvasInteractionModeImpl.cs" />
+    <Compile Include="SafeSources\MarkCenterSourceImpl.cs" />
+    <Compile Include="SafeSources\MarkLocateCompletedEventArgsImpl.cs" />
+    <Compile Include="SafeSources\MarkLocateJobImpl.cs" />
+    <Compile Include="SafeSources\MarkLocateResultImpl.cs" />
+    <Compile Include="SafeSources\MarkMatchParametersImpl.cs" />
+    <Compile Include="SafeSources\MarkTeachDataImpl.cs" />
+    <Compile Include="SafeSources\MaskStrokeImpl.cs" />
+    <Compile Include="SafeSources\MaskStrokeModeImpl.cs" />
+    <Compile Include="SafeSources\RegionShapeImpl.cs" />
+    <Compile Include="SafeSources\HalconMarkLocatorImpl.cs" />
+    <Compile Include="SafeSources\AssemblyInfoImpl.cs" />
+    <Compile Include="SafeSources\MarkLocatorSdkImpl.cs" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>
