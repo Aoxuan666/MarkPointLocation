@@ -102,6 +102,7 @@ namespace Seprays.MarkVision
 			{
 				featurePoints = FilterFeaturePointsInRoi(ExtractFeaturePoints(source, job), job.MaskStrokes, job.TemplateRoi, job.TemplateRoiShape);
 			}
+			featurePoints = FilterFeaturePointsInRoi(featurePoints, job.MaskStrokes, job.TemplateRoi, job.TemplateRoiShape);
 			if (CountRealPoints(featurePoints) < 12)
 			{
 				throw new InvalidOperationException("有效外轮廓特征点不足，请调整模板 ROI、边缘阈值或擦除范围。");
@@ -112,8 +113,21 @@ namespace Seprays.MarkVision
 			{
 				GenContoursFromFeaturePoints(featurePoints, out contoursXld);
 				HTuple numLevels = ((job.Parameters.NumLevels <= 0) ? new HTuple("auto") : new HTuple(job.Parameters.NumLevels));
-				string metric = (job.Parameters.UsePolarity ? "ignore_local_polarity" : "ignore_global_polarity");
-				HOperatorSet.CreateScaledShapeModelXld(contoursXld, numLevels, DegreesToRadians(job.Parameters.AngleStartDegrees), DegreesToRadians(job.Parameters.AngleExtentDegrees), "auto", job.Parameters.ScaleMin, job.Parameters.ScaleMax, "auto", "auto", metric, job.Parameters.MinContrast, out modelId);
+				HOperatorSet.CreateScaledShapeModelXld(contoursXld, numLevels, DegreesToRadians(job.Parameters.AngleStartDegrees), DegreesToRadians(job.Parameters.AngleExtentDegrees), "auto", job.Parameters.ScaleMin, job.Parameters.ScaleMax, "auto", "auto", "ignore_local_polarity", job.Parameters.MinContrast, out modelId);
+				if (!job.Parameters.UsePolarity)
+				{
+					// Polygon XLDs have no edge_direction attribute. Recover polarity
+					// from the template image at the model's unmodified default origin.
+					var points = featurePoints.Where(point => !IsContourSeparator(point)).ToList();
+					double row = (points.Min(point => point.Y) + points.Max(point => point.Y)) * 0.5;
+					double column = (points.Min(point => point.X) + points.Max(point => point.X)) * 0.5;
+					using (var image = HalconImageLease.FromBitmap(source))
+					{
+						HOperatorSet.VectorAngleToRigid(0, 0, 0, row, column, 0, out var transform);
+						using (transform)
+							HOperatorSet.SetShapeModelMetric(image.Image, modelId, transform, "ignore_global_polarity");
+					}
+				}
 				SetModelOriginToTemplateCenter(modelId, featurePoints, job.TemplateRoi);
 				List<List<PointF>> contours = ReadModelContours(modelId);
 				if (contours.Sum((List<PointF> contour) => contour.Count) < 12)
@@ -259,7 +273,7 @@ namespace Seprays.MarkVision
 					int meanSize = job.Parameters.SearchMeanSize;
 					HOperatorSet.MeanImage(image.Image, out filtered, meanSize, meanSize);
 					HObject imageToSearch = filtered;
-					if (job.SearchRoiEnabled)
+					if (job.SearchRoiEnabled && !job.SearchRoi.IsEmpty)
 					{
 						Rectangle searchRect = ToPixelRectangle(job.SearchRoi, source.Size);
 						HOperatorSet.GenRectangle1(out searchRegion, searchRect.Top, searchRect.Left, searchRect.Bottom - 1, searchRect.Right - 1);
@@ -702,7 +716,7 @@ namespace Seprays.MarkVision
 				{
 					double x = (double)point.X * scale;
 					double y = (double)point.Y * scale;
-					transformed.Add(new PointF((float)(col + x * cos - y * sin), (float)(row + x * sin + y * cos)));
+					transformed.Add(new PointF((float)(col + x * cos + y * sin), (float)(row - x * sin + y * cos)));
 				}
 				if (transformed.Count > 1)
 				{
@@ -806,7 +820,10 @@ namespace Seprays.MarkVision
 			}
 			double num2 = Math.Abs(refinedRadius - expectedRadius) / expectedRadius;
 			double centerShift = Distance(refinedCenter, initialCenter);
-			if (num2 > parameters.CircleRadialTolerance || centerShift > expectedRadius * parameters.CircleMaxCenterShiftRatio)
+			// A circle center can legitimately move relative to the shape-model origin.
+			// The shape match is already valid at this point; do not turn a usable match
+			// into a failure only because the optional circle refinement moved farther.
+			if (num2 > parameters.CircleRadialTolerance)
 			{
 				return false;
 			}

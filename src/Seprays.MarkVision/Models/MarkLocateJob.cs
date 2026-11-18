@@ -22,7 +22,7 @@ namespace Seprays.MarkVision
 		public RectangleF SearchRoi { get; set; }
 
 		[field: OptionalField(VersionAdded = 2)]
-		public bool SearchRoiEnabled { get; set; } = true;
+			public bool SearchRoiEnabled { get; set; }
 
 		/// <summary>
 		/// Set by the host application. The setup page never changes this flag.
@@ -92,15 +92,15 @@ namespace Seprays.MarkVision
 				RectangleF imageBounds = new RectangleF(0f, 0f, imageSize.Width, imageSize.Height);
 				TemplateRoi = NormalizeRoi(TemplateRoi, imageBounds, 16f);
 				SearchRoi = NormalizeRoi(SearchRoi, imageBounds, 16f);
-				if (TemplateRoi.IsEmpty)
+				if (!TemplateRoi.IsEmpty && TemplateRoiShape == RegionShape.Circle)
 				{
-					float width = Math.Max(32f, (float)imageSize.Width * 0.3f);
-					float height = Math.Max(32f, (float)imageSize.Height * 0.3f);
-					TemplateRoi = RectangleF.Intersect(new RectangleF(((float)imageSize.Width - width) * 0.5f, ((float)imageSize.Height - height) * 0.5f, width, height), imageBounds);
-				}
-				if (SearchRoi.IsEmpty)
-				{
-					SearchRoi = ExpandRoi(TemplateRoi, 100f, imageBounds);
+					// Keep one circular domain for extraction, filtering and display.
+					float side = Math.Min(Math.Max(TemplateRoi.Width, TemplateRoi.Height), Math.Min(imageBounds.Width, imageBounds.Height));
+					float centerX = TemplateRoi.Left + TemplateRoi.Width * 0.5f;
+					float centerY = TemplateRoi.Top + TemplateRoi.Height * 0.5f;
+					float left = Math.Max(imageBounds.Left, Math.Min(imageBounds.Right - side, centerX - side * 0.5f));
+					float top = Math.Max(imageBounds.Top, Math.Min(imageBounds.Bottom - side, centerY - side * 0.5f));
+					TemplateRoi = new RectangleF(left, top, side, side);
 				}
 			}
 		}

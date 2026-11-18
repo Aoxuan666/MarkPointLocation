@@ -6,6 +6,8 @@ namespace Seprays.MarkVision
 		EditTemplateRoi,
 		EditSearchRoi,
 		ExcludeMask,
-		RestoreMask
+		RestoreMask,
+		BrushExclude,
+		BrushRestore
 	}
 }

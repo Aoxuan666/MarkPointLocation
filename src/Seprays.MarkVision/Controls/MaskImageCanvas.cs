@@ -47,6 +47,9 @@ namespace Seprays.MarkVision
 
 		private bool[] _featureVisibility = new bool[0];
 
+		// Cache ROI membership so brush dabs only test their own bounds.
+		private bool[] _featureInTemplate = new bool[0];
+
 		private List<List<PointF>> _modelContours = new List<List<PointF>>();
 
 		private List<List<PointF>> _matchedContours = new List<List<PointF>>();
@@ -64,6 +67,17 @@ namespace Seprays.MarkVision
 		private bool _panning;
 
 		private bool _painting;
+
+		// Commit one change notification per completed brush gesture.
+		private bool _brushChanged;
+
+		private PointF _lastBrushPoint;
+
+		private bool IsBrushMode => InteractionMode == CanvasInteractionMode.BrushExclude || InteractionMode == CanvasInteractionMode.BrushRestore;
+
+		private bool IsMaskMode => IsBrushMode || InteractionMode == CanvasInteractionMode.ExcludeMask || InteractionMode == CanvasInteractionMode.RestoreMask;
+
+		private bool IsRestoreMode => InteractionMode == CanvasInteractionMode.RestoreMask || InteractionMode == CanvasInteractionMode.BrushRestore;
 
 		private PointF _maskStartImagePoint;
 
@@ -94,6 +108,7 @@ namespace Seprays.MarkVision
 			}
 			set
 			{
+				EndPointerInteraction();
 				_sourceImage?.Dispose();
 				_sourceImage = ((value == null) ? null : new Bitmap(value));
 				RebuildMaskOverlay();
@@ -198,6 +213,10 @@ namespace Seprays.MarkVision
 			}
 			set
 			{
+				if (_interactionMode != value)
+				{
+					EndPointerInteraction();
+				}
 				_interactionMode = value;
 				Cursor = ((value == CanvasInteractionMode.Pan) ? Cursors.Hand : Cursors.Cross);
 				Invalidate();
@@ -309,6 +328,8 @@ namespace Seprays.MarkVision
 		[Category("操作")]
 		public event EventHandler MaskChanged;
 
+		internal event EventHandler MaskEditStarted;
+
 		[Category("操作")]
 		public event EventHandler ZoomChanged;
 
@@ -345,6 +366,7 @@ namespace Seprays.MarkVision
 
 		public void UndoMaskStroke()
 		{
+			EndPointerInteraction();
 			if (_maskStrokes.Count == 0)
 			{
 				return;
@@ -366,6 +388,7 @@ namespace Seprays.MarkVision
 
 		public void ClearMask()
 		{
+			EndPointerInteraction();
 			if (_maskStrokes.Count != 0)
 			{
 				_maskStrokes.Clear();
@@ -400,6 +423,10 @@ namespace Seprays.MarkVision
 		protected override void OnMouseWheel(MouseEventArgs e)
 		{
 			base.OnMouseWheel(e);
+			if (_painting || _roiDragMode != RoiDragMode.None)
+			{
+				return;
+			}
 			if (_sourceImage != null)
 			{
 				PointF imagePoint = ScreenToImage(e.Location);
@@ -416,14 +443,15 @@ namespace Seprays.MarkVision
 		{
 			base.OnMouseDown(e);
 			Focus();
-			if (_sourceImage == null)
+			if (!Enabled || _sourceImage == null || _painting || _panning || _roiDragMode != RoiDragMode.None)
 			{
 				return;
 			}
 			PointF rawImagePoint = ScreenToImage(e.Location);
 			bool insideImage = IsInsideImage(rawImagePoint);
-			PointF imagePoint = (_cursorImagePoint = ClampImagePoint(rawImagePoint));
-			_hasCursor = true;
+			PointF imagePoint = ClampImagePoint(rawImagePoint);
+			_cursorImagePoint = IsBrushMode ? rawImagePoint : imagePoint;
+			_hasCursor = insideImage;
 			if (e.Button == MouseButtons.Middle || (e.Button == MouseButtons.Left && InteractionMode == CanvasInteractionMode.Pan))
 			{
 				_panning = true;
@@ -441,16 +469,25 @@ namespace Seprays.MarkVision
 				{
 					return;
 				}
-				if (InteractionMode == CanvasInteractionMode.ExcludeMask || InteractionMode == CanvasInteractionMode.RestoreMask)
+				if (IsMaskMode)
 				{
 					if (!_templateRoi.IsEmpty)
 					{
 						_activeStrokeGroup = _nextStrokeGroup++;
 						_painting = true;
-						_maskStartImagePoint = imagePoint;
-						_maskPreviewBounds = CreateMaskBounds(imagePoint, imagePoint);
 						base.Capture = true;
+						if (IsBrushMode)
+						{
+							_lastBrushPoint = rawImagePoint;
+							PaintBrushSegment(rawImagePoint, rawImagePoint);
+						}
+						else
+						{
+							_maskStartImagePoint = imagePoint;
+							_maskPreviewBounds = CreateMaskBounds(imagePoint, imagePoint);
+						}
 						Invalidate();
+						if (IsBrushMode) Update();
 					}
 				}
 				else if ((InteractionMode == CanvasInteractionMode.EditTemplateRoi || InteractionMode == CanvasInteractionMode.EditSearchRoi) && (InteractionMode != CanvasInteractionMode.EditSearchRoi || SearchRoiEnabled))
@@ -479,8 +516,10 @@ namespace Seprays.MarkVision
 			}
 			PointF previousCursor = _cursorImagePoint;
 			bool hadCursor = _hasCursor;
-			PointF imagePoint = (_cursorImagePoint = ClampImagePoint(ScreenToImage(e.Location)));
-			_hasCursor = true;
+			PointF rawImagePoint = ScreenToImage(e.Location);
+			PointF imagePoint = ClampImagePoint(rawImagePoint);
+			_cursorImagePoint = IsBrushMode ? rawImagePoint : imagePoint;
+			_hasCursor = IsInsideImage(rawImagePoint) && ClientRectangle.Contains(e.Location);
 			if (_panning)
 			{
 				_pan = new PointF(_pan.X + (float)e.X - (float)_lastScreenPoint.X, _pan.Y + (float)e.Y - (float)_lastScreenPoint.Y);
@@ -489,8 +528,25 @@ namespace Seprays.MarkVision
 			}
 			else if (_painting)
 			{
-				_maskPreviewBounds = CreateMaskBounds(_maskStartImagePoint, imagePoint);
-				Invalidate();
+				if (IsBrushMode)
+				{
+					if (rawImagePoint != _lastBrushPoint)
+					{
+						PaintBrushSegment(_lastBrushPoint, rawImagePoint);
+						_lastBrushPoint = rawImagePoint;
+					}
+				}
+				else
+				{
+					_maskPreviewBounds = CreateMaskBounds(_maskStartImagePoint, imagePoint);
+					Invalidate();
+				}
+				if (IsBrushMode)
+				{
+					InvalidateBrushCursor(previousCursor, hadCursor, _cursorImagePoint);
+					// Paint the dirty area now, even while mouse messages keep arriving.
+					Update();
+				}
 			}
 			else if (_roiDragMode != RoiDragMode.None)
 			{
@@ -514,14 +570,32 @@ namespace Seprays.MarkVision
 		protected override void OnMouseUp(MouseEventArgs e)
 		{
 			base.OnMouseUp(e);
+			if (_painting && e.Button != MouseButtons.Left)
+			{
+				return;
+			}
 			bool num = _roiDragMode != RoiDragMode.None && InteractionMode == CanvasInteractionMode.EditTemplateRoi;
 			if (_painting)
 			{
+				bool maskAdded = false;
+				if (IsBrushMode)
+				{
+					PointF end = ScreenToImage(e.Location);
+					if (end != _lastBrushPoint)
+					{
+						PaintBrushSegment(_lastBrushPoint, end);
+					}
+				}
+				else
+				{
+					maskAdded = AddMaskStroke(CreateMaskBounds(_maskStartImagePoint, ClampImagePoint(ScreenToImage(e.Location))));
+				}
 				_painting = false;
+				bool brushChanged = _brushChanged;
+				_brushChanged = false;
 				base.Capture = false;
-				bool maskAdded = AddMaskStroke(_maskPreviewBounds);
 				_maskPreviewBounds = RectangleF.Empty;
-				if (maskAdded)
+				if (maskAdded || brushChanged)
 				{
 					this.MaskChanged?.Invoke(this, EventArgs.Empty);
 				}
@@ -544,11 +618,45 @@ namespace Seprays.MarkVision
 		protected override void OnMouseLeave(EventArgs e)
 		{
 			base.OnMouseLeave(e);
-			if (!_painting)
+			_hasCursor = false;
+			Invalidate();
+		}
+
+		protected override void OnMouseCaptureChanged(EventArgs e)
+		{
+			base.OnMouseCaptureChanged(e);
+			if (!Capture)
 			{
-				PointF previousCursor = _cursorImagePoint;
-				_hasCursor = false;
-				InvalidateBrushCursor(previousCursor, hadPrevious: true, previousCursor);
+				EndPointerInteraction();
+			}
+		}
+
+		protected override void OnEnabledChanged(EventArgs e)
+		{
+			base.OnEnabledChanged(e);
+			if (!Enabled)
+			{
+				EndPointerInteraction();
+			}
+		}
+
+		private void EndPointerInteraction()
+		{
+			bool brushChanged = _brushChanged;
+			_brushChanged = false;
+			_painting = false;
+			_panning = false;
+			_roiDragMode = RoiDragMode.None;
+			_maskPreviewBounds = RectangleF.Empty;
+			_hasCursor = false;
+			if (Capture)
+			{
+				Capture = false;
+			}
+			Invalidate();
+			if (brushChanged)
+			{
+				this.MaskChanged?.Invoke(this, EventArgs.Empty);
 			}
 		}
 
@@ -587,13 +695,52 @@ namespace Seprays.MarkVision
 				DrawMaskShape(graphics, _maskPreviewBounds, _maskShape, (InteractionMode == CanvasInteractionMode.ExcludeMask) ? Color.FromArgb(235, 70, 76) : Color.FromArgb(48, 210, 132), true);
 				return;
 			}
-			if (!_hasCursor || (InteractionMode != CanvasInteractionMode.ExcludeMask && InteractionMode != CanvasInteractionMode.RestoreMask))
+			if (!_hasCursor || !IsMaskMode)
 			{
 				return;
 			}
-			Color cursorColor = ((InteractionMode == CanvasInteractionMode.ExcludeMask) ? Color.FromArgb(235, 70, 76) : Color.FromArgb(48, 210, 132));
-			RectangleF cursorBounds = CreateMaskBounds(_cursorImagePoint, _cursorImagePoint);
-			DrawMaskShape(graphics, cursorBounds, _maskShape, cursorColor, true);
+			Color cursorColor = IsRestoreMode ? Color.FromArgb(48, 210, 132) : Color.FromArgb(235, 70, 76);
+			RectangleF cursorBounds = GetMaskCursorBounds(_cursorImagePoint);
+			DrawMaskShape(graphics, cursorBounds, IsBrushMode ? RegionShape.Circle : _maskShape, cursorColor, true);
+		}
+
+		private RectangleF GetMaskCursorBounds(PointF point)
+		{
+			return IsBrushMode ? new RectangleF(point.X - BrushRadius, point.Y - BrushRadius, BrushRadius * 2f, BrushRadius * 2f) : CreateMaskBounds(point, point);
+		}
+
+		private void PaintBrushSegment(PointF start, PointF end)
+		{
+			float dx = end.X - start.X;
+			float dy = end.Y - start.Y;
+			double distance = Math.Sqrt(dx * dx + dy * dy);
+			int steps = Math.Max(1, (int)Math.Ceiling(distance / Math.Max(0.5f, BrushRadius * 0.5f)));
+			List<MaskStroke> added = new List<MaskStroke>();
+			for (int index = 1; index <= steps; index++)
+			{
+				float t = (float)index / steps;
+				PointF center = new PointF(start.X + dx * t, start.Y + dy * t);
+				RectangleF bounds = new RectangleF(center.X - BrushRadius, center.Y - BrushRadius, BrushRadius * 2f, BrushRadius * 2f);
+				if (!bounds.IntersectsWith(_templateRoi) || !bounds.IntersectsWith(new RectangleF(PointF.Empty, _sourceImage.Size)))
+				{
+					continue;
+				}
+				added.Add(new MaskStroke { Center = center, Radius = BrushRadius, Width = BrushRadius * 2f, Height = BrushRadius * 2f,
+					Shape = RegionShape.Circle, Mode = IsRestoreMode ? MaskStrokeMode.Restore : MaskStrokeMode.Exclude, GroupId = _activeStrokeGroup });
+			}
+			if (added.Count == 0)
+			{
+				return;
+			}
+			_maskStrokes.AddRange(added);
+			RenderMaskStrokes(added);
+			ApplyStrokesToFeatureVisibility(added);
+			InvalidateMaskArea(added);
+			if (!_brushChanged)
+			{
+				_brushChanged = true;
+				this.MaskEditStarted?.Invoke(this, EventArgs.Empty);
+			}
 		}
 
 		private bool AddMaskStroke(RectangleF bounds)
@@ -980,9 +1127,11 @@ namespace Seprays.MarkVision
 		private void RebuildFeatureVisibility()
 		{
 			_featureVisibility = new bool[_featurePoints.Count];
+			_featureInTemplate = new bool[_featurePoints.Count];
 			for (int index = 0; index < _featureVisibility.Length; index++)
 			{
-				_featureVisibility[index] = !IsContourSeparator(_featurePoints[index]);
+				_featureInTemplate[index] = !IsContourSeparator(_featurePoints[index]) && RegionShapeGeometry.Contains(_featurePoints[index], _templateRoi, _templateRoiShape);
+				_featureVisibility[index] = _featureInTemplate[index];
 			}
 			foreach (MaskStroke stroke in _maskStrokes)
 			{
@@ -1002,27 +1151,28 @@ namespace Seprays.MarkVision
 
 		private void ApplyStrokeToFeatureVisibility(MaskStroke stroke)
 		{
-			if (stroke == null || stroke.GetBounds().IsEmpty || _featureVisibility.Length != _featurePoints.Count)
+			if (stroke == null || _featureVisibility.Length != _featurePoints.Count)
 			{
 				return;
 			}
+			RectangleF bounds = stroke.GetBounds();
+			if (bounds.IsEmpty) return;
 			bool visible = stroke.Mode == MaskStrokeMode.Restore;
 			for (int index = 0; index < _featurePoints.Count; index++)
 			{
+				if (!_featureInTemplate[index] || _featureVisibility[index] == visible) continue;
 				PointF point = _featurePoints[index];
-				if (!IsContourSeparator(point))
+				if (point.X < bounds.Left || point.X > bounds.Right || point.Y < bounds.Top || point.Y > bounds.Bottom) continue;
+				if (RegionShapeGeometry.Contains(point, bounds, stroke.Shape))
 				{
-					if (RegionShapeGeometry.Contains(point, stroke.GetBounds(), stroke.Shape))
-					{
-						_featureVisibility[index] = visible;
-					}
+					_featureVisibility[index] = visible;
 				}
 			}
 		}
 
 		private void RebuildVisibleFeaturePointList()
 		{
-			_visibleFeaturePoints = new List<PointF>(_featurePoints.Count);
+			_visibleFeaturePoints.Clear();
 			bool segmentHasPoint = false;
 			for (int index = 0; index < _featurePoints.Count; index++)
 			{
@@ -1068,16 +1218,17 @@ namespace Seprays.MarkVision
 
 		private void InvalidateBrushCursor(PointF previousCursor, bool hadPrevious, PointF currentCursor)
 		{
-			if (InteractionMode == CanvasInteractionMode.ExcludeMask || InteractionMode == CanvasInteractionMode.RestoreMask)
+			if (IsMaskMode)
 			{
-				float padding = BrushRadius + 5f / Math.Max(0.02f, _zoom);
-				RectangleF dirty = RectangleF.FromLTRB(currentCursor.X - padding, currentCursor.Y - padding, currentCursor.X + padding, currentCursor.Y + padding);
+				// Area cursors move inward at image edges. Invalidate their actual drawn bounds.
+				RectangleF dirty = ImageRectangleToScreen(GetMaskCursorBounds(currentCursor));
 				if (hadPrevious)
 				{
-					RectangleF old = RectangleF.FromLTRB(previousCursor.X - padding, previousCursor.Y - padding, previousCursor.X + padding, previousCursor.Y + padding);
+					RectangleF old = ImageRectangleToScreen(GetMaskCursorBounds(previousCursor));
 					dirty = RectangleF.Union(dirty, old);
 				}
-				Invalidate(Rectangle.Ceiling(ImageRectangleToScreen(dirty)));
+				dirty.Inflate(4f, 4f);
+				Invalidate(Rectangle.FromLTRB((int)Math.Floor(dirty.Left), (int)Math.Floor(dirty.Top), (int)Math.Ceiling(dirty.Right), (int)Math.Ceiling(dirty.Bottom)));
 			}
 		}
 
@@ -1125,7 +1276,15 @@ namespace Seprays.MarkVision
 			{
 				return RectangleF.Empty;
 			}
-			return ClampRoi(RegionShapeGeometry.NormalizeBounds(bounds, shape));
+			bounds = RegionShapeGeometry.NormalizeBounds(bounds, shape);
+			if (shape == RegionShape.Circle && _sourceImage != null)
+			{
+				float side = Math.Min(bounds.Width, Math.Min(_sourceImage.Width, _sourceImage.Height));
+				float left = Math.Max(0f, Math.Min(_sourceImage.Width - side, bounds.Left + (bounds.Width - side) * 0.5f));
+				float top = Math.Max(0f, Math.Min(_sourceImage.Height - side, bounds.Top + (bounds.Height - side) * 0.5f));
+				return new RectangleF(left, top, side, side);
+			}
+			return ClampRoi(bounds);
 		}
 
 		private RectangleF ClampRoi(RectangleF roi)

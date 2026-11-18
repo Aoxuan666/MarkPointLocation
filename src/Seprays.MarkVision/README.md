@@ -43,6 +43,8 @@ finally
 
 `MarkLocatorSdk` 只公开 `OpenSetupDialog` 和 `RunInspection` 两个无重载方法。SDK 不释放上位机传入的图像；返回的非空 `ResultImage` 由上位机负责释放。
 
+`RunInspection` 的 `returnResultImage` 默认值为 `false`，设为 `true` 时在独立图像上绘制匹配轮廓、中心点及找圆结果。设置窗口底部的“确认”按钮返回完成 Job 的深克隆；“取消”或关闭窗口返回 `null`。
+
 `OpenSetupDialog` 会自动在 STA UI 线程创建设置窗口；上位机从后台线程调用时无需额外切换线程。
 
 ## 页面操作

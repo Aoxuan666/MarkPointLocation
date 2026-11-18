@@ -35,9 +35,9 @@
     <Reference Include="System.Windows.Forms" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="SafeSources\MainFormImpl.cs"><SubType>Form</SubType></Compile>
-    <Compile Include="SafeSources\ProgramImpl.cs" />
-    <Compile Include="SafeSources\AssemblyInfoImpl.cs" />
+    <Compile Include="SafeSources\MarkSetupMainForm.cs"><SubType>Form</SubType></Compile>
+    <Compile Include="SafeSources\MarkSetupProgram.cs" />
+    <Compile Include="SafeSources\MarkSetupAssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Seprays.MarkVision\Seprays.MarkVision.csproj">

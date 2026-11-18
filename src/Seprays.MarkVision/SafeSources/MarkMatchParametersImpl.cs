@@ -71,13 +71,13 @@ namespace Seprays.MarkVision
 
 		[Category("搜索范围")]
 		[DisplayName("起始角度(度)")]
-		[DefaultValue(-180.0)]
-		public double AngleStartDegrees { get; set; } = -180.0;
+		[DefaultValue(-5.0)]
+		public double AngleStartDegrees { get; set; } = -5.0;
 
 		[Category("搜索范围")]
 		[DisplayName("角度范围(度)")]
-		[DefaultValue(360.0)]
-		public double AngleExtentDegrees { get; set; } = 360.0;
+		[DefaultValue(10.0)]
+		public double AngleExtentDegrees { get; set; } = 10.0;
 
 		[Category("搜索范围")]
 		[DisplayName("最小缩放")]
@@ -98,7 +98,7 @@ namespace Seprays.MarkVision
 		[DisplayName("最大重叠")]
 		[DefaultValue(0.0)]
 		public double MaxOverlap { get; set; }
-
+		 
 		[Category("匹配判定")]
 		[DisplayName("贪婪度")]
 		[DefaultValue(0.7)]
@@ -106,8 +106,8 @@ namespace Seprays.MarkVision
 
 		[Category("掩膜工具")]
 		[DisplayName("画笔半径(px)")]
-		[DefaultValue(18.0)]
-		public double BrushRadius { get; set; } = 18.0;
+		[DefaultValue(6.0)]
+		public double BrushRadius { get; set; } = 6.0;
 
 		[Category("圆心精修")]
 		[DisplayName("启用圆心精修")]
@@ -161,7 +161,7 @@ namespace Seprays.MarkVision
 			MaxFeaturePoints = Clamp(MaxFeaturePoints, 100, 50000);
 			NumLevels = Clamp(NumLevels, 0, 12);
 			Contrast = Clamp(Contrast, 1, 255);
-			MinContrast = Clamp(MinContrast, 1, Contrast);
+			MinContrast = Clamp(MinContrast, 1, 255);
 			AngleStartDegrees = Clamp(AngleStartDegrees, -360.0, 360.0);
 			AngleExtentDegrees = Clamp(AngleExtentDegrees, 0.1, 360.0);
 			ScaleMin = Clamp(ScaleMin, 0.1, 4.0);

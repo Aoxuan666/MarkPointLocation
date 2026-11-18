@@ -12,7 +12,13 @@ namespace Seprays.MarkVision
 	{
 		private readonly HalconMarkLocator _locator = new HalconMarkLocator();
 
+		private readonly MarkLocatorSdk _sdk = new MarkLocatorSdk();
+
 		private Bitmap _sourceImage;
+
+		private Bitmap _testImage;
+
+		private bool _showingTestImage;
 
 		private MarkLocateJob _job = new MarkLocateJob();
 
@@ -51,6 +57,16 @@ namespace Seprays.MarkVision
 		private ToolStripButton btnActual;
 
 		private ToolStripLabel lblZoom;
+
+		private ToolStripButton btnLoadTeachImage;
+
+		private ToolStripButton btnLoadTestImage;
+
+		private ToolStripButton btnShowTeachImage;
+
+		private ToolStripButton btnShowTestImage;
+
+		private ToolStripLabel lblImageState;
 
 		private SplitContainer splitMain;
 
@@ -103,6 +119,8 @@ namespace Seprays.MarkVision
 		private Button btnExtract;
 
 		private Button btnResetFeatures;
+
+		private Button btnBrushMask;
 
 		private GroupBox grpModel;
 
@@ -205,6 +223,10 @@ namespace Seprays.MarkVision
 
 		public void LoadConfiguration(Bitmap sourceImage, MarkLocateJob currentJob)
 		{
+			if (_busy)
+			{
+				throw new InvalidOperationException("建模或测试期间不能加载新配置。");
+			}
 			if (sourceImage == null)
 			{
 				throw new ArgumentNullException("sourceImage");
@@ -214,6 +236,9 @@ namespace Seprays.MarkVision
 			{
 				_sourceImage?.Dispose();
 				_sourceImage = new Bitmap(sourceImage);
+				_testImage?.Dispose();
+				_testImage = null;
+				_showingTestImage = false;
 				_job = currentJob?.DeepClone() ?? new MarkLocateJob();
 				_job.Normalize(_sourceImage.Size);
 				_rawFeaturePoints = ((_job.TeachData.FeaturePoints == null) ? new List<PointF>() : new List<PointF>(_job.TeachData.FeaturePoints));
@@ -232,6 +257,7 @@ namespace Seprays.MarkVision
 				canvas.ModelContours = new List<List<PointF>>();
 				canvas.MatchedContours = new List<List<PointF>>();
 				UpdateFeatureCount();
+				UpdateImageState();
 				UpdateSearchRoiState();
 				UpdateModelState();
 			}
@@ -244,6 +270,11 @@ namespace Seprays.MarkVision
 
 		public bool ValidateConfiguration(out string message)
 		{
+			if (_busy)
+			{
+				message = "请等待建模或测试完成。";
+				return false;
+			}
 			PullControlsToJob();
 			UpdateVisibleFeaturePoints();
 			if (_sourceImage == null)
@@ -283,6 +314,70 @@ namespace Seprays.MarkVision
 			_job.TemplateRoiShape = shape;
 			btnTemplateShape.Text = "模板形状: " + GetShapeText(shape);
 			ExtractFeaturePoints(invalidateModel: false, showMessage: false);
+		}
+
+		public void LoadTeachingImage(Bitmap image)
+		{
+			if (_busy)
+			{
+				throw new InvalidOperationException("建模或测试期间不能加载新图像。");
+			}
+			if (image == null)
+			{
+				throw new ArgumentNullException("image");
+			}
+			_sourceImage?.Dispose();
+			_sourceImage = new Bitmap(image);
+			_showingTestImage = false;
+			_job.Normalize(_sourceImage.Size);
+			_rawFeaturePoints.Clear();
+			canvas.SourceImage = _sourceImage;
+			canvas.FeaturePoints = _rawFeaturePoints;
+			canvas.MatchedContours = new List<List<PointF>>();
+			InvalidateTeachModel("示教图已更新，请重新创建模型。", notifyChanged: false);
+			UpdateImageState();
+			ExtractFeaturePoints(invalidateModel: false, showMessage: false);
+		}
+
+		public void LoadTestImage(Bitmap image)
+		{
+			if (_busy)
+			{
+				throw new InvalidOperationException("建模或测试期间不能加载新图像。");
+			}
+			if (image == null)
+			{
+				throw new ArgumentNullException("image");
+			}
+			_testImage?.Dispose();
+			_testImage = new Bitmap(image);
+			ShowTestImage();
+			SetStatus("测试图已加载，可执行测试定位。");
+		}
+
+		public void ShowTeachingImage()
+		{
+			if (_sourceImage == null)
+			{
+				return;
+			}
+			_showingTestImage = false;
+			canvas.SourceImage = _sourceImage;
+			canvas.FeaturePoints = _rawFeaturePoints;
+			UpdateImageState();
+		}
+
+		public void ShowTestImage()
+		{
+			if (_testImage == null)
+			{
+				SetStatus("请先加载测试图。");
+				return;
+			}
+			_showingTestImage = true;
+			canvas.SourceImage = _testImage;
+			canvas.FeaturePoints = new List<PointF>();
+			UpdateImageState();
 		}
 
 		private void maskShape_Click(object sender, EventArgs e)
@@ -331,6 +426,12 @@ namespace Seprays.MarkVision
 			canvas.ClearMask();
 		}
 
+		private void btnBrushMask_Click(object sender, EventArgs e)
+		{
+			SetInteractionMode(canvas.InteractionMode == CanvasInteractionMode.BrushExclude
+				? CanvasInteractionMode.Pan : CanvasInteractionMode.BrushExclude);
+		}
+
 		private void btnFit_Click(object sender, EventArgs e)
 		{
 			canvas.FitToWindow();
@@ -339,6 +440,36 @@ namespace Seprays.MarkVision
 		private void btnActual_Click(object sender, EventArgs e)
 		{
 			canvas.ActualSize();
+		}
+
+		private void btnLoadTeachImage_Click(object sender, EventArgs e)
+		{
+			using (var dialog = new OpenFileDialog())
+			{
+				dialog.Filter = "图像文件|*.bmp;*.png;*.jpg;*.jpeg;*.tif;*.tiff|所有文件|*.*";
+				if (dialog.ShowDialog(this) != DialogResult.OK) return;
+				using (var image = new Bitmap(dialog.FileName)) LoadTeachingImage(image);
+			}
+		}
+
+		private void btnLoadTestImage_Click(object sender, EventArgs e)
+		{
+			using (var dialog = new OpenFileDialog())
+			{
+				dialog.Filter = "图像文件|*.bmp;*.png;*.jpg;*.jpeg;*.tif;*.tiff|所有文件|*.*";
+				if (dialog.ShowDialog(this) != DialogResult.OK) return;
+				using (var image = new Bitmap(dialog.FileName)) LoadTestImage(image);
+			}
+		}
+
+		private void btnShowTeachImage_Click(object sender, EventArgs e)
+		{
+			ShowTeachingImage();
+		}
+
+		private void btnShowTestImage_Click(object sender, EventArgs e)
+		{
+			ShowTestImage();
 		}
 
 		private void btnExtract_Click(object sender, EventArgs e)
@@ -367,6 +498,7 @@ namespace Seprays.MarkVision
 			{
 				return;
 			}
+			ShowTeachingImage();
 			PullControlsToJob();
 			UpdateVisibleFeaturePoints();
 			if (CountRealPoints(_job.TeachData.FeaturePoints) < 12)
@@ -391,6 +523,10 @@ namespace Seprays.MarkVision
 						((IDisposable)workImage).Dispose();
 					}
 				}
+				if (IsDisposed || Disposing)
+				{
+					return;
+				}
 				_job.TeachData = teachData;
 				canvas.MatchedContours = new List<List<PointF>>();
 				UpdateModelState();
@@ -400,36 +536,50 @@ namespace Seprays.MarkVision
 			}
 			catch (Exception ex)
 			{
+				if (IsDisposed || Disposing)
+				{
+					return;
+				}
 				SetStatus("模型创建失败：" + ex.Message);
 				MessageBox.Show(this, ex.Message, "模型创建失败", MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
 			}
 			finally
 			{
-				SetBusy(busy: false, null);
+				if (!IsDisposed && !Disposing)
+				{
+					SetBusy(busy: false, null);
+				}
 			}
 		}
 
 		private async void btnTest_Click(object sender, EventArgs e)
 		{
-			if (_busy || _sourceImage == null)
+			if (_busy)
 			{
 				return;
 			}
+			if (_testImage == null)
+			{
+				SetStatus("请先载入测试图，再执行测试定位。");
+				return;
+			}
+			Bitmap inspectionImage = _testImage;
 			PullControlsToJob();
 			if (_job.EnableTemplateMatching && !_job.TeachData.HasModel)
 			{
 				MessageBox.Show(this, "请先创建外轮廓模板。", "测试定位", MessageBoxButtons.OK, MessageBoxIcon.Asterisk);
 				return;
 			}
+			ShowTestImage();
 			SetBusy(busy: true, "正在测试定位...");
 			try
 			{
 				MarkLocateJob workJob = _job.DeepClone();
-				Bitmap workImage = new Bitmap(_sourceImage);
+				Bitmap workImage = new Bitmap(inspectionImage);
 				MarkLocateResult result;
 				try
 				{
-					result = await Task.Run(() => _locator.Locate(workImage, workJob));
+					result = await Task.Run(() => _sdk.RunInspection(workImage, workJob));
 				}
 				finally
 				{
@@ -438,13 +588,20 @@ namespace Seprays.MarkVision
 						((IDisposable)workImage).Dispose();
 					}
 				}
+				if (IsDisposed || Disposing)
+				{
+					return;
+				}
 				canvas.MatchedContours = result.MatchedContours;
 				SetStatus(result.Message);
 				this.TestCompleted?.Invoke(this, new MarkLocateCompletedEventArgs(result));
 			}
 			finally
 			{
-				SetBusy(busy: false, null);
+				if (!IsDisposed && !Disposing)
+				{
+					SetBusy(busy: false, null);
+				}
 			}
 		}
 
@@ -482,7 +639,7 @@ namespace Seprays.MarkVision
 		{
 			if (!_loading)
 			{
-				_job.MaskStrokes = canvas.MaskStrokes.Select((MaskStroke stroke) => stroke.DeepClone()).ToList();
+				_job.MaskStrokes = new List<MaskStroke>(canvas.MaskStrokes);
 				UpdateVisibleFeaturePoints();
 				InvalidateTeachModel("特征点掩膜已修改，请重新创建模型。", notifyChanged: true);
 			}
@@ -491,6 +648,14 @@ namespace Seprays.MarkVision
 		private void canvas_ZoomChanged(object sender, EventArgs e)
 		{
 			lblZoom.Text = $"{canvas.ZoomFactor * 100f:F0}%";
+		}
+
+		private void canvas_MaskEditStarted(object sender, EventArgs e)
+		{
+			if (!_loading)
+			{
+				InvalidateTeachModel("特征点掩膜已修改，请重新创建模型。", notifyChanged: false);
+			}
 		}
 
 		private void featureParameter_ValueChanged(object sender, EventArgs e)
@@ -629,7 +794,7 @@ namespace Seprays.MarkVision
 			_job.TemplateRoiShape = canvas.TemplateRoiShape;
 			_job.SearchRoi = canvas.SearchRoi;
 			_job.SearchRoiEnabled = chkSearchRoiEnabled.Checked;
-			_job.MaskStrokes = canvas.MaskStrokes.Select((MaskStroke stroke) => stroke.DeepClone()).ToList();
+			_job.MaskStrokes = new List<MaskStroke>(canvas.MaskStrokes);
 			MarkMatchParameters parameters = _job.Parameters;
 			parameters.TemplateMeanSize = decimal.ToInt32(numTemplateMean.Value);
 			parameters.EdgeSigma = (double)numEdgeSigma.Value;
@@ -663,7 +828,10 @@ namespace Seprays.MarkVision
 		private void UpdateVisibleFeaturePoints()
 		{
 			_job.TeachData = _job.TeachData ?? new MarkTeachData();
-			_job.TeachData.FeaturePoints = HalconMarkLocator.FilterFeaturePointsInRoi(_rawFeaturePoints, _job.MaskStrokes, _job.TemplateRoi, _job.TemplateRoiShape);
+			// Reuse the canvas's incremental filtering while editing the teaching image.
+			_job.TeachData.FeaturePoints = !_showingTestImage
+				? new List<PointF>(canvas.VisibleFeaturePoints)
+				: HalconMarkLocator.FilterFeaturePointsInRoi(_rawFeaturePoints, _job.MaskStrokes, _job.TemplateRoi, _job.TemplateRoiShape);
 			UpdateFeatureCount();
 		}
 
@@ -702,6 +870,8 @@ namespace Seprays.MarkVision
 			btnSearchRoi.Checked = mode == CanvasInteractionMode.EditSearchRoi;
 			btnMaskExclude.Checked = mode == CanvasInteractionMode.ExcludeMask;
 			btnMaskRestore.Checked = mode == CanvasInteractionMode.RestoreMask;
+			btnBrushMask.BackColor = mode == CanvasInteractionMode.BrushExclude
+				? Color.FromArgb(208, 232, 226) : SystemColors.Control;
 		}
 
 		private void UpdateSearchRoiState()
@@ -730,15 +900,29 @@ namespace Seprays.MarkVision
 			btnTest.Enabled = ready && !_busy;
 		}
 
+		private void UpdateImageState()
+		{
+			if (lblImageState == null) return;
+			lblImageState.Text = _showingTestImage ? "当前图：测试图" : "当前图：示教图";
+			btnShowTeachImage.Checked = !_showingTestImage;
+			btnShowTestImage.Checked = _showingTestImage;
+			btnShowTeachImage.Enabled = _sourceImage != null && !_busy;
+			btnShowTestImage.Enabled = _testImage != null && !_busy;
+		}
+
 		private void SetBusy(bool busy, string status)
 		{
 			_busy = busy;
+			canvas.Enabled = !busy;
 			toolMain.Enabled = !busy;
 			panelParameters.Enabled = !busy;
 			btnTeach.Enabled = !busy;
 			btnTest.Enabled = !busy && (_job.TeachData.HasModel || (!_job.EnableTemplateMatching && _job.EnableCircleDetection));
 			base.UseWaitCursor = busy;
 			UpdateSearchRoiState();
+			btnLoadTeachImage.Enabled = !busy;
+			btnLoadTestImage.Enabled = !busy;
+			UpdateImageState();
 			if (!string.IsNullOrWhiteSpace(status))
 			{
 				SetStatus(status);
@@ -788,6 +972,7 @@ namespace Seprays.MarkVision
 			if (disposing)
 			{
 				_sourceImage?.Dispose();
+				_testImage?.Dispose();
 				components?.Dispose();
 			}
 			base.Dispose(disposing);
@@ -810,6 +995,11 @@ namespace Seprays.MarkVision
 			this.btnFit = new System.Windows.Forms.ToolStripButton();
 			this.btnActual = new System.Windows.Forms.ToolStripButton();
 			this.lblZoom = new System.Windows.Forms.ToolStripLabel();
+			this.btnLoadTeachImage = new System.Windows.Forms.ToolStripButton();
+			this.btnLoadTestImage = new System.Windows.Forms.ToolStripButton();
+			this.btnShowTeachImage = new System.Windows.Forms.ToolStripButton();
+			this.btnShowTestImage = new System.Windows.Forms.ToolStripButton();
+			this.lblImageState = new System.Windows.Forms.ToolStripLabel();
 			this.splitMain = new System.Windows.Forms.SplitContainer();
 			this.canvas = new Seprays.MarkVision.MaskImageCanvas();
 			this.panelSettings = new System.Windows.Forms.Panel();
@@ -861,6 +1051,7 @@ namespace Seprays.MarkVision
 			this.lblFeatureCount = new System.Windows.Forms.Label();
 			this.btnExtract = new System.Windows.Forms.Button();
 			this.btnResetFeatures = new System.Windows.Forms.Button();
+			this.btnBrushMask = new System.Windows.Forms.Button();
 			this.panelActions = new System.Windows.Forms.Panel();
 			this.btnTeach = new System.Windows.Forms.Button();
 			this.btnTest = new System.Windows.Forms.Button();
@@ -904,10 +1095,10 @@ namespace Seprays.MarkVision
 			this.toolMain.BackColor = System.Drawing.Color.FromArgb(245, 247, 249);
 			this.toolMain.GripStyle = System.Windows.Forms.ToolStripGripStyle.Hidden;
 			this.toolMain.ImageScalingSize = new System.Drawing.Size(20, 20);
-			this.toolMain.Items.AddRange(new System.Windows.Forms.ToolStripItem[13]
+			this.toolMain.Items.AddRange(new System.Windows.Forms.ToolStripItem[14]
 			{
-				this.btnTemplateRoi, this.btnTemplateShape, this.btnSearchRoi, this.toolSeparator1, this.btnMaskExclude, this.btnMaskRestore, this.btnMaskShape, this.btnUndoMask, this.btnClearMask, this.toolSeparator2, this.btnFit,
-				this.btnActual, this.lblZoom
+				this.btnTemplateRoi, this.btnTemplateShape, this.btnSearchRoi, this.toolSeparator1, this.btnUndoMask, this.toolSeparator2, this.btnFit,
+				this.btnActual, this.btnLoadTeachImage, this.btnLoadTestImage, this.btnShowTeachImage, this.btnShowTestImage, this.lblImageState, this.lblZoom
 			});
 			this.toolMain.Location = new System.Drawing.Point(0, 0);
 			this.toolMain.Name = "toolMain";
@@ -976,6 +1167,28 @@ namespace Seprays.MarkVision
 			this.btnActual.Click += new System.EventHandler(btnActual_Click);
 			this.lblZoom.Alignment = System.Windows.Forms.ToolStripItemAlignment.Right;
 			this.lblZoom.Text = "100%";
+			this.btnLoadTeachImage.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text;
+			this.btnLoadTeachImage.Name = "btnLoadTeachImage";
+			this.btnLoadTeachImage.Text = "载入示教图";
+			this.btnLoadTeachImage.ToolTipText = "载入用于提取特征和创建模型的示教图";
+			this.btnLoadTeachImage.Click += new System.EventHandler(btnLoadTeachImage_Click);
+			this.btnLoadTestImage.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text;
+			this.btnLoadTestImage.Name = "btnLoadTestImage";
+			this.btnLoadTestImage.Text = "载入测试图";
+			this.btnLoadTestImage.ToolTipText = "载入用于复用模型测试定位的测试图";
+			this.btnLoadTestImage.Click += new System.EventHandler(btnLoadTestImage_Click);
+			this.btnShowTeachImage.CheckOnClick = true;
+			this.btnShowTeachImage.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text;
+			this.btnShowTeachImage.Name = "btnShowTeachImage";
+			this.btnShowTeachImage.Text = "看示教图";
+			this.btnShowTeachImage.Click += new System.EventHandler(btnShowTeachImage_Click);
+			this.btnShowTestImage.CheckOnClick = true;
+			this.btnShowTestImage.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text;
+			this.btnShowTestImage.Name = "btnShowTestImage";
+			this.btnShowTestImage.Text = "看测试图";
+			this.btnShowTestImage.Click += new System.EventHandler(btnShowTestImage_Click);
+			this.lblImageState.Text = "当前图：示教图";
+			this.lblImageState.ToolTipText = "当前画布显示的图像用途";
 			this.splitMain.Dock = System.Windows.Forms.DockStyle.Fill;
 			this.splitMain.FixedPanel = System.Windows.Forms.FixedPanel.Panel2;
 			this.splitMain.Location = new System.Drawing.Point(0, 35);
@@ -996,6 +1209,7 @@ namespace Seprays.MarkVision
 			this.canvas.TemplateRoiEditCompleted += new System.EventHandler(canvas_TemplateRoiEditCompleted);
 			this.canvas.SearchRoiChanged += new System.EventHandler(canvas_SearchRoiChanged);
 			this.canvas.MaskChanged += new System.EventHandler(canvas_MaskChanged);
+			this.canvas.MaskEditStarted += new System.EventHandler(canvas_MaskEditStarted);
 			this.canvas.ZoomChanged += new System.EventHandler(canvas_ZoomChanged);
 			this.panelSettings.BackColor = System.Drawing.Color.FromArgb(247, 248, 250);
 			this.panelSettings.Controls.Add(this.panelParameters);
@@ -1177,8 +1391,15 @@ namespace Seprays.MarkVision
 			this.btnResetFeatures.Text = "清空掩膜并重提取";
 			this.btnResetFeatures.UseVisualStyleBackColor = true;
 			this.btnResetFeatures.Click += new System.EventHandler(btnResetFeatures_Click);
+			this.btnBrushMask.Location = new System.Drawing.Point(14, 200);
+			this.btnBrushMask.Name = "btnBrushMask";
+			this.btnBrushMask.Size = new System.Drawing.Size(288, 32);
+			this.btnBrushMask.Text = "画笔掩膜";
+			this.btnBrushMask.UseVisualStyleBackColor = true;
+			this.btnBrushMask.Click += new System.EventHandler(btnBrushMask_Click);
 			this.grpFeature.Controls.Add(this.btnExtract);
 			this.grpFeature.Controls.Add(this.btnResetFeatures);
+			this.grpFeature.Controls.Add(this.btnBrushMask);
 			this.grpModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
 			this.grpModel.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f, System.Drawing.FontStyle.Bold);
 			this.grpModel.Location = new System.Drawing.Point(0, 704);
@@ -1386,7 +1607,7 @@ namespace Seprays.MarkVision
 			this.lblGreediness.Visible = false;
 			this.numGreediness.Visible = false;
 			this.grpCircle.Visible = false;
-			this.grpFeature.Size = new System.Drawing.Size(316, 210);
+			this.grpFeature.Size = new System.Drawing.Size(316, 246);
 			this.lblFeatureDistance.Location = new System.Drawing.Point(14, 62);
 			this.numFeatureDistance.Location = new System.Drawing.Point(146, 62);
 			this.lblBrushRadius.Location = new System.Drawing.Point(14, 96);
@@ -1394,9 +1615,9 @@ namespace Seprays.MarkVision
 			this.lblFeatureCount.Location = new System.Drawing.Point(14, 130);
 			this.btnExtract.Location = new System.Drawing.Point(14, 164);
 			this.btnResetFeatures.Location = new System.Drawing.Point(159, 164);
-			this.grpSearch.Location = new System.Drawing.Point(0, 218);
+			this.grpSearch.Location = new System.Drawing.Point(0, 254);
 			this.grpSearch.Size = new System.Drawing.Size(316, 270);
-			this.grpModel.Location = new System.Drawing.Point(0, 496);
+			this.grpModel.Location = new System.Drawing.Point(0, 532);
 			this.grpCircle.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
 			this.grpCircle.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f, System.Drawing.FontStyle.Bold);
 			this.grpCircle.Location = new System.Drawing.Point(0, 844);

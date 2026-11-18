@@ -287,7 +287,7 @@ namespace Seprays.MarkVision
 						MatchedContours = TransformContours(job.TeachData.ModelContours, row, col, angle, scale)
 					};
 					job.Parameters.EnableCircleRefinement = circleEnabled;
-					ApplyCircleRefinement(source, job.Parameters, result);
+					ApplyCircleRefinement(source, job.TemplateRoi, job.Parameters, result);
 					return result;
 				}
 				catch (Exception ex)
@@ -702,7 +702,7 @@ namespace Seprays.MarkVision
 				{
 					double x = (double)point.X * scale;
 					double y = (double)point.Y * scale;
-					transformed.Add(new PointF((float)(col + x * cos - y * sin), (float)(row + x * sin + y * cos)));
+					transformed.Add(new PointF((float)(col + x * cos + y * sin), (float)(row - x * sin + y * cos)));
 				}
 				if (transformed.Count > 1)
 				{
@@ -712,7 +712,7 @@ namespace Seprays.MarkVision
 			return result;
 		}
 
-		private static void ApplyCircleRefinement(Bitmap source, MarkMatchParameters parameters, MarkLocateResult result)
+		private static void ApplyCircleRefinement(Bitmap source, RectangleF templateRoi, MarkMatchParameters parameters, MarkLocateResult result)
 		{
 			if (!parameters.EnableCircleRefinement)
 			{
@@ -720,7 +720,12 @@ namespace Seprays.MarkVision
 			}
 			PointF center;
 			float radius;
-			if (parameters.ExpectedCircleRadius <= 1.0)
+			double expectedRadius = parameters.ExpectedCircleRadius;
+			if (expectedRadius <= 1.0 && !templateRoi.IsEmpty)
+			{
+				expectedRadius = Math.Min(templateRoi.Width, templateRoi.Height) * 0.5;
+			}
+			if (expectedRadius <= 1.0)
 			{
 				if (parameters.RequireCircleRefinement)
 				{
@@ -728,7 +733,7 @@ namespace Seprays.MarkVision
 					result.Message = "形状模板已匹配，但圆心精修缺少示教圆半径。";
 				}
 			}
-			else if (TryRefineCircle(source, result.ModelPoint, parameters.ExpectedCircleRadius * result.Scale, parameters, out center, out radius))
+			else if (TryRefineCircle(source, result.ModelPoint, expectedRadius * result.Scale, parameters, out center, out radius))
 			{
 				result.CircleFound = true;
 				result.CirclePoint = center;
@@ -801,7 +806,10 @@ namespace Seprays.MarkVision
 			}
 			double num2 = Math.Abs(refinedRadius - expectedRadius) / expectedRadius;
 			double centerShift = Distance(refinedCenter, initialCenter);
-			if (num2 > parameters.CircleRadialTolerance || centerShift > expectedRadius * parameters.CircleMaxCenterShiftRatio)
+			// A circle center can legitimately move relative to the shape-model origin.
+			// The shape match is already valid at this point; do not turn a usable match
+			// into a failure only because the optional circle refinement moved farther.
+			if (num2 > parameters.CircleRadialTolerance)
 			{
 				return false;
 			}
