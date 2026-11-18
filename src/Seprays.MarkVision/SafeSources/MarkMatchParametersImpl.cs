@@ -25,6 +25,12 @@ namespace Seprays.MarkVision
 		public double EdgeSigma { get; set; } = 1.2;
 
 		[Category("特征提取")]
+		[DisplayName("自动阈值")]
+		[DefaultValue(true)]
+		[field: OptionalField(VersionAdded = 4)]
+		public bool AutoEdgeThreshold { get; set; } = true;
+
+		[Category("特征提取")]
 		[DisplayName("低阈值")]
 		[DefaultValue(15.0)]
 		[field: OptionalField(VersionAdded = 2)]
@@ -38,9 +44,9 @@ namespace Seprays.MarkVision
 
 		[Category("特征提取")]
 		[DisplayName("点最小间距(px)")]
-		[DefaultValue(6.0)]
+		[DefaultValue(2.0)]
 		[field: OptionalField(VersionAdded = 2)]
-		public double FeatureMinDistancePx { get; set; } = 6.0;
+		public double FeatureMinDistancePx { get; set; } = 2.0;
 
 		[Category("特征提取")]
 		[DisplayName("最大特征点数")]
@@ -81,28 +87,28 @@ namespace Seprays.MarkVision
 
 		[Category("搜索范围")]
 		[DisplayName("最小缩放")]
-		[DefaultValue(0.8)]
-		public double ScaleMin { get; set; } = 0.8;
+		[DefaultValue(0.95)]
+		public double ScaleMin { get; set; } = 0.95;
 
 		[Category("搜索范围")]
 		[DisplayName("最大缩放")]
-		[DefaultValue(1.2)]
-		public double ScaleMax { get; set; } = 1.2;
+		[DefaultValue(1.05)]
+		public double ScaleMax { get; set; } = 1.05;
 
 		[Category("匹配判定")]
 		[DisplayName("最小分数")]
-		[DefaultValue(0.75)]
-		public double MinScore { get; set; } = 0.75;
+		[DefaultValue(0.70)]
+		public double MinScore { get; set; } = 0.70;
 
 		[Category("匹配判定")]
 		[DisplayName("最大重叠")]
 		[DefaultValue(0.0)]
 		public double MaxOverlap { get; set; }
-		 
+
 		[Category("匹配判定")]
 		[DisplayName("贪婪度")]
-		[DefaultValue(0.7)]
-		public double Greediness { get; set; } = 0.7;
+		[DefaultValue(0.5)]
+		public double Greediness { get; set; } = 0.5;
 
 		[Category("掩膜工具")]
 		[DisplayName("画笔半径(px)")]
@@ -112,7 +118,7 @@ namespace Seprays.MarkVision
 		[Category("圆心精修")]
 		[DisplayName("启用圆心精修")]
 		[DefaultValue(false)]
-		[Description("对应原 Template_Circle 流程，在形状匹配后通过径向边缘点稳健拟合圆。")]
+		[Description("对应原 Template_Circle 流程，在形状匹配后通过 HALCON 测量稳健拟合圆。")]
 		public bool EnableCircleRefinement { get; set; }
 
 		[Category("圆心精修")]

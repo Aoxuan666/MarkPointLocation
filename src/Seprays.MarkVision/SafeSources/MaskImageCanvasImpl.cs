@@ -29,24 +29,44 @@ namespace Seprays.MarkVision
 
 		private Bitmap _sourceImage;
 
+		private Bitmap _displayImage;
+
 		private Bitmap _maskOverlay;
+
+		private bool _maskOverlayDirty;
 
 		private string _inspectionHudText;
 
 		private bool _inspectionSucceeded;
 
+		private PointF? _matchedCenter;
+
+		private bool _matchedCircleFound;
+
+		private PointF _matchedCircleCenter;
+
+		private float _matchedCircleRadius;
+
 		public void ShowInspectionResult(MarkLocateResult result, double elapsedMilliseconds)
 		{
-			_inspectionSucceeded = result.Success;
-			_inspectionHudText = result.Success
+			_inspectionSucceeded = result != null && result.Success;
+			_matchedCenter = (result != null && result.Success) ? (PointF?)result.ModelPoint : null;
+			_matchedCircleFound = result != null && result.CircleFound && result.CircleRadius > 0f && !float.IsInfinity(result.CircleRadius);
+			_matchedCircleCenter = result?.CirclePoint ?? PointF.Empty;
+			_matchedCircleRadius = result?.CircleRadius ?? 0f;
+			_inspectionHudText = _inspectionSucceeded
 				? $"定位成功    分数 {result.Score:F3}\nX {result.ModelPoint.X:F3}    Y {result.ModelPoint.Y:F3} px\n角度 {result.AngleRadians * 180.0 / Math.PI:F3}°    缩放 {result.Scale:F4}\n耗时 {elapsedMilliseconds:F1} ms"
-				: $"定位失败    耗时 {elapsedMilliseconds:F1} ms\n{result.Message}";
+				: $"定位失败    耗时 {elapsedMilliseconds:F1} ms\n{result?.Message ?? "定位失败。"}";
 			Invalidate();
 		}
 
 		public void ClearInspectionResult()
 		{
 			_inspectionHudText = null;
+			_matchedCenter = null;
+			_matchedCircleFound = false;
+			_matchedCircleCenter = PointF.Empty;
+			_matchedCircleRadius = 0f;
 			Invalidate();
 		}
 
@@ -55,7 +75,7 @@ namespace Seprays.MarkVision
 
 		private RectangleF _templateRoi;
 
-		private RegionShape _templateRoiShape = RegionShape.Circle;
+		private RegionShape _templateRoiShape = RegionShape.Rectangle;
 
 		private RectangleF _searchRoi;
 
@@ -131,8 +151,14 @@ namespace Seprays.MarkVision
 			{
 				EndPointerInteraction();
 				_sourceImage?.Dispose();
+				_displayImage?.Dispose();
+				_displayImage = null;
 				ClearInspectionResult();
 				_sourceImage = ((value == null) ? null : new Bitmap(value));
+				if (_sourceImage != null)
+				{
+					_displayImage = CreateDisplayBitmap(_sourceImage);
+				}
 				RebuildMaskOverlay();
 				RebuildFeatureVisibility();
 				FitToWindow();
@@ -154,7 +180,17 @@ namespace Seprays.MarkVision
 				if (!ApproximatelyEqual(_templateRoi, normalized))
 				{
 					_templateRoi = normalized;
-					RebuildMaskOverlay();
+					if (_roiDragMode != RoiDragMode.None)
+					{
+						if (_maskStrokes.Count > 0)
+						{
+							_maskOverlayDirty = true;
+						}
+					}
+					else
+					{
+						RebuildMaskOverlay();
+					}
 					RebuildFeatureVisibility();
 					Invalidate();
 					this.TemplateRoiChanged?.Invoke(this, EventArgs.Empty);
@@ -163,13 +199,13 @@ namespace Seprays.MarkVision
 		}
 
 		[Category("Mark 编辑")]
-		[DefaultValue(RegionShape.Circle)]
+		[DefaultValue(RegionShape.Rectangle)]
 		public RegionShape TemplateRoiShape
 		{
 			get { return _templateRoiShape; }
 			set
 			{
-				RegionShape normalized = Enum.IsDefined(typeof(RegionShape), value) ? value : RegionShape.Circle;
+				RegionShape normalized = Enum.IsDefined(typeof(RegionShape), value) ? value : RegionShape.Rectangle;
 				if (_templateRoiShape != normalized)
 				{
 					_templateRoiShape = normalized;
@@ -348,6 +384,9 @@ namespace Seprays.MarkVision
 		public event EventHandler SearchRoiChanged;
 
 		[Category("操作")]
+		public event EventHandler SearchRoiEditCompleted;
+
+		[Category("操作")]
 		public event EventHandler MaskChanged;
 
 		internal event EventHandler MaskEditStarted;
@@ -431,6 +470,7 @@ namespace Seprays.MarkVision
 			if (disposing)
 			{
 				_sourceImage?.Dispose();
+				_displayImage?.Dispose();
 				_maskOverlay?.Dispose();
 			}
 			base.Dispose(disposing);
@@ -596,7 +636,8 @@ namespace Seprays.MarkVision
 			{
 				return;
 			}
-			bool num = _roiDragMode != RoiDragMode.None && InteractionMode == CanvasInteractionMode.EditTemplateRoi;
+			bool templateEdited = _roiDragMode != RoiDragMode.None && InteractionMode == CanvasInteractionMode.EditTemplateRoi;
+			bool searchEdited = _roiDragMode != RoiDragMode.None && InteractionMode == CanvasInteractionMode.EditSearchRoi;
 			if (_painting)
 			{
 				bool maskAdded = false;
@@ -630,9 +671,19 @@ namespace Seprays.MarkVision
 			}
 			_roiDragMode = RoiDragMode.None;
 			base.Capture = false;
-			if (num)
+			if (_maskOverlayDirty)
+			{
+				_maskOverlayDirty = false;
+				RebuildMaskOverlay();
+				Invalidate();
+			}
+			if (templateEdited)
 			{
 				this.TemplateRoiEditCompleted?.Invoke(this, EventArgs.Empty);
+			}
+			if (searchEdited)
+			{
+				this.SearchRoiEditCompleted?.Invoke(this, EventArgs.Empty);
 			}
 			UpdateIdleCursor(e.Location);
 		}
@@ -675,6 +726,11 @@ namespace Seprays.MarkVision
 			{
 				Capture = false;
 			}
+			if (_maskOverlayDirty)
+			{
+				_maskOverlayDirty = false;
+				RebuildMaskOverlay();
+			}
 			Invalidate();
 			if (brushChanged)
 			{
@@ -693,7 +749,8 @@ namespace Seprays.MarkVision
 			}
 			graphics.InterpolationMode = ((_zoom >= 1f) ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBicubic);
 			graphics.PixelOffsetMode = PixelOffsetMode.Half;
-			graphics.DrawImage(rect: new RectangleF(_pan.X, _pan.Y, (float)_sourceImage.Width * _zoom, (float)_sourceImage.Height * _zoom), image: _sourceImage);
+			Bitmap renderImage = _displayImage ?? _sourceImage;
+			graphics.DrawImage(rect: new RectangleF(_pan.X, _pan.Y, (float)_sourceImage.Width * _zoom, (float)_sourceImage.Height * _zoom), image: renderImage);
 			if (ShowTemplateOverlay && _maskOverlay != null)
 			{
 				Rectangle destination = Rectangle.Round(new RectangleF(_pan.X, _pan.Y, (float)_sourceImage.Width * _zoom, (float)_sourceImage.Height * _zoom));
@@ -708,6 +765,7 @@ namespace Seprays.MarkVision
 			if (ShowTemplateOverlay)
 				DrawFeaturePoints(graphics, _visibleFeaturePoints, Color.FromArgb(255, 176, 32), 2f);
 			DrawContourPoints(graphics, _matchedContours, Color.DeepSkyBlue, 2.2f);
+			DrawMatchedOverlays(graphics);
 			if (SearchRoiEnabled)
 			{
 				DrawRoi(graphics, _searchRoi, RegionShape.Rectangle, Color.FromArgb(255, 255, 196, 64), "搜索区域", InteractionMode == CanvasInteractionMode.EditSearchRoi, drawCenterLines: false);
@@ -725,6 +783,34 @@ namespace Seprays.MarkVision
 				DrawMaskShape(graphics, cursorBounds, IsBrushMode ? RegionShape.Circle : _maskShape, cursorColor, true);
 			}
 			DrawInspectionHud(graphics);
+		}
+
+		private void DrawMatchedOverlays(Graphics graphics)
+		{
+			if (_matchedCenter.HasValue)
+			{
+				PointF screenCenter = ImageToScreen(_matchedCenter.Value);
+				using (Pen centerPen = new Pen(Color.LimeGreen, 2f))
+				{
+					graphics.DrawLine(centerPen, screenCenter.X - 10f, screenCenter.Y, screenCenter.X + 10f, screenCenter.Y);
+					graphics.DrawLine(centerPen, screenCenter.X, screenCenter.Y - 10f, screenCenter.X, screenCenter.Y + 10f);
+				}
+			}
+			if (_matchedCircleFound && _matchedCircleRadius > 0f && !float.IsInfinity(_matchedCircleRadius))
+			{
+				RectangleF screenCircle = ImageRectangleToScreen(new RectangleF(
+					_matchedCircleCenter.X - _matchedCircleRadius,
+					_matchedCircleCenter.Y - _matchedCircleRadius,
+					_matchedCircleRadius * 2f,
+					_matchedCircleRadius * 2f));
+				PointF screenCircleCenter = ImageToScreen(_matchedCircleCenter);
+				using (Pen circlePen = new Pen(Color.Orange, 2f))
+				{
+					graphics.DrawEllipse(circlePen, screenCircle);
+					graphics.DrawLine(circlePen, screenCircleCenter.X - 10f, screenCircleCenter.Y, screenCircleCenter.X + 10f, screenCircleCenter.Y);
+					graphics.DrawLine(circlePen, screenCircleCenter.X, screenCircleCenter.Y - 10f, screenCircleCenter.X, screenCircleCenter.Y + 10f);
+				}
+			}
 		}
 
 		private void DrawInspectionHud(Graphics graphics)
@@ -764,8 +850,16 @@ namespace Seprays.MarkVision
 				{
 					continue;
 				}
-				added.Add(new MaskStroke { Center = center, Radius = BrushRadius, Width = BrushRadius * 2f, Height = BrushRadius * 2f,
-					Shape = RegionShape.Circle, Mode = IsRestoreMode ? MaskStrokeMode.Restore : MaskStrokeMode.Exclude, GroupId = _activeStrokeGroup });
+				added.Add(new MaskStroke
+				{
+					Center = center,
+					Radius = BrushRadius,
+					Width = BrushRadius * 2f,
+					Height = BrushRadius * 2f,
+					Shape = RegionShape.Circle,
+					Mode = IsRestoreMode ? MaskStrokeMode.Restore : MaskStrokeMode.Exclude,
+					GroupId = _activeStrokeGroup
+				});
 			}
 			if (added.Count == 0)
 			{
@@ -948,7 +1042,7 @@ namespace Seprays.MarkVision
 				Cursor = Cursors.Hand;
 				return;
 			}
-			if (InteractionMode == CanvasInteractionMode.ExcludeMask || InteractionMode == CanvasInteractionMode.RestoreMask)
+			if (IsMaskMode)
 			{
 				Cursor = Cursors.Cross;
 				return;
@@ -1108,22 +1202,38 @@ namespace Seprays.MarkVision
 			}
 		}
 
+		private static Bitmap CreateDisplayBitmap(Bitmap source)
+		{
+			Bitmap display = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppPArgb);
+			using (Graphics graphics = Graphics.FromImage(display))
+			{
+				graphics.CompositingMode = CompositingMode.SourceCopy;
+				graphics.DrawImageUnscaled(source, 0, 0);
+			}
+			return display;
+		}
+
 		private void RebuildMaskOverlay()
 		{
+			_maskOverlayDirty = false;
 			_maskOverlay?.Dispose();
 			_maskOverlay = null;
-			if (_sourceImage != null)
+			if (_sourceImage != null && _maskStrokes.Count > 0 && !_templateRoi.IsEmpty)
 			{
-				_maskOverlay = new Bitmap(_sourceImage.Width, _sourceImage.Height, PixelFormat.Format32bppArgb);
+				_maskOverlay = new Bitmap(_sourceImage.Width, _sourceImage.Height, PixelFormat.Format32bppPArgb);
 				RenderMaskStrokes(_maskStrokes);
 			}
 		}
 
 		private void RenderMaskStrokes(IEnumerable<MaskStroke> strokes)
 		{
-			if (_maskOverlay == null || _templateRoi.IsEmpty)
+			if (_sourceImage == null || _templateRoi.IsEmpty || _maskStrokes.Count == 0)
 			{
 				return;
+			}
+			if (_maskOverlay == null)
+			{
+				_maskOverlay = new Bitmap(_sourceImage.Width, _sourceImage.Height, PixelFormat.Format32bppPArgb);
 			}
 			using (Graphics graphics = Graphics.FromImage(_maskOverlay))
 			{
@@ -1131,9 +1241,8 @@ namespace Seprays.MarkVision
 				graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
 				using (GraphicsPath templatePath = RegionShapeGeometry.CreatePath(_templateRoi, _templateRoiShape))
 				{
-				graphics.SetClip(templatePath);
-				using (SolidBrush excludeBrush = new SolidBrush(Color.FromArgb(255, 235, 60, 65)))
-				{
+					graphics.SetClip(templatePath);
+					using (SolidBrush excludeBrush = new SolidBrush(Color.FromArgb(255, 235, 60, 65)))
 					using (SolidBrush restoreBrush = new SolidBrush(Color.Transparent))
 					{
 						foreach (MaskStroke stroke in strokes ?? Enumerable.Empty<MaskStroke>())
@@ -1143,28 +1252,34 @@ namespace Seprays.MarkVision
 								RectangleF bounds = stroke.GetBounds();
 								using (GraphicsPath path = RegionShapeGeometry.CreatePath(bounds, stroke.Shape))
 								{
-								if (stroke.Mode == MaskStrokeMode.Exclude)
-								{
-									graphics.CompositingMode = CompositingMode.SourceOver;
-									graphics.FillPath(excludeBrush, path);
-								}
-								else
-								{
-									graphics.CompositingMode = CompositingMode.SourceCopy;
-									graphics.FillPath(restoreBrush, path);
-								}
+									if (stroke.Mode == MaskStrokeMode.Exclude)
+									{
+										graphics.CompositingMode = CompositingMode.SourceOver;
+										graphics.FillPath(excludeBrush, path);
+									}
+									else
+									{
+										graphics.CompositingMode = CompositingMode.SourceCopy;
+										graphics.FillPath(restoreBrush, path);
+									}
 								}
 							}
 						}
 					}
-				}
-				graphics.ResetClip();
+					graphics.ResetClip();
 				}
 			}
 		}
 
 		private void RebuildFeatureVisibility()
 		{
+			if (_featurePoints.Count == 0)
+			{
+				_featureVisibility = Array.Empty<bool>();
+				_featureInTemplate = Array.Empty<bool>();
+				_visibleFeaturePoints.Clear();
+				return;
+			}
 			_featureVisibility = new bool[_featurePoints.Count];
 			_featureInTemplate = new bool[_featurePoints.Count];
 			for (int index = 0; index < _featureVisibility.Length; index++)
@@ -1273,11 +1388,7 @@ namespace Seprays.MarkVision
 
 		private static bool IsContourSeparator(PointF point)
 		{
-			if (!float.IsNaN(point.X))
-			{
-				return float.IsNaN(point.Y);
-			}
-			return true;
+			return float.IsNaN(point.X) || float.IsNaN(point.Y);
 		}
 
 		private bool IsInsideImage(PointF point)
@@ -1338,9 +1449,9 @@ namespace Seprays.MarkVision
 			}
 			float width = Math.Max(8f, Math.Min(_sourceImage.Width, roi.Width));
 			float height = Math.Max(8f, Math.Min(_sourceImage.Height, roi.Height));
-			float num = Math.Max(0f, Math.Min((float)_sourceImage.Width - width, roi.X));
-			float y = Math.Max(0f, Math.Min((float)_sourceImage.Height - height, roi.Y));
-			return new RectangleF(num, y, width, height);
+			float left = Math.Max(0f, Math.Min((float)_sourceImage.Width - width, roi.X));
+			float top = Math.Max(0f, Math.Min((float)_sourceImage.Height - height, roi.Y));
+			return new RectangleF(left, top, width, height);
 		}
 
 		private PointF ClampImagePoint(PointF point)
@@ -1376,11 +1487,10 @@ namespace Seprays.MarkVision
 
 		private static bool ApproximatelyEqual(RectangleF left, RectangleF right)
 		{
-			if (Math.Abs(left.X - right.X) < 0.01f && Math.Abs(left.Y - right.Y) < 0.01f && Math.Abs(left.Width - right.Width) < 0.01f)
-			{
-				return Math.Abs(left.Height - right.Height) < 0.01f;
-			}
-			return false;
+			return Math.Abs(left.X - right.X) < 0.01f &&
+				Math.Abs(left.Y - right.Y) < 0.01f &&
+				Math.Abs(left.Width - right.Width) < 0.01f &&
+				Math.Abs(left.Height - right.Height) < 0.01f;
 		}
 
 		private static List<List<PointF>> CloneContours(IEnumerable<List<PointF>> contours)

@@ -121,6 +121,8 @@ public static class RegressionChecks
             var canvas = (MaskImageCanvas)type.GetField("canvas", flags).GetValue(control);
             var toolMain = (ToolStrip)type.GetField("toolMain", flags).GetValue(control);
             var brushButton = (Button)type.GetField("btnBrushMask", flags).GetValue(control);
+            var chkAutoThreshold = (CheckBox)type.GetField("chkAutoThreshold", flags).GetValue(control);
+            var btnTemplateShape = (ToolStripDropDownButton)type.GetField("btnTemplateShape", flags).GetValue(control);
             var angleStart = (NumericUpDown)type.GetField("numAngleStart", flags).GetValue(control);
             var angleExtent = (NumericUpDown)type.GetField("numAngleExtent", flags).GetValue(control);
             var brushRadius = (NumericUpDown)type.GetField("numBrushRadius", flags).GetValue(control);
@@ -128,6 +130,11 @@ public static class RegressionChecks
             Require(angleStart.Value == -5m, "Setup page angle start default must be -5 degrees.");
             Require(angleExtent.Value == 10m, "Setup page angle extent default must be 10 degrees.");
             Require(brushRadius.Value == 6m, "Setup page brush radius default must be 6 pixels.");
+            Require(canvas.TemplateRoiShape == RegionShape.Rectangle && control.Job.TemplateRoiShape == RegionShape.Rectangle,
+                "Default template ROI shape must be Rectangle.");
+            Require(btnTemplateShape.Text == "模板形状: 矩形", "Template shape dropdown default must say 矩形.");
+            Require(chkAutoThreshold.Checked && chkAutoThreshold.Text == "自动阈值" && !chkAutoThreshold.Text.Contains("HALCON"),
+                "Auto threshold checkbox must be checked and not display (HALCON).");
 
             Require(canvas.TemplateRoi.IsEmpty, "New configuration must not display a template ROI.");
             Require(canvas.SearchRoi.IsEmpty && !canvas.SearchRoiEnabled,
@@ -680,9 +687,10 @@ public static class RegressionChecks
         using (var image = new Bitmap(640, 480))
         {
             canvas.SourceImage = image;
+            canvas.TemplateRoiShape = RegionShape.Circle;
             foreach (var roi in cases)
             {
-                var job = new MarkLocateJob { TemplateRoi = roi };
+                var job = new MarkLocateJob { TemplateRoiShape = RegionShape.Circle, TemplateRoi = roi };
                 job.Normalize(image.Size);
                 var normalized = job.TemplateRoi;
                 Require(normalized.Width == normalized.Height, "Circle is not square.");
@@ -700,7 +708,7 @@ public static class RegressionChecks
             TemplateRoi = new RectangleF(100, 100, 120, 60) };
         rectangular.Normalize(new Size(640, 480));
         Require(rectangular.TemplateRoi == new RectangleF(100, 100, 120, 60), "Rectangle changed unexpectedly.");
-        var circular = new MarkLocateJob { TemplateRoi = rectangular.TemplateRoi };
+        var circular = new MarkLocateJob { TemplateRoiShape = RegionShape.Circle, TemplateRoi = rectangular.TemplateRoi };
         circular.Normalize(new Size(640, 480));
         var geometry = typeof(MarkLocateJob).Assembly.GetType("Seprays.MarkVision.RegionShapeGeometry");
         Require((bool)geometry.GetMethod("Contains").Invoke(null, new object[] {
@@ -779,6 +787,275 @@ public static class RegressionChecks
             Require(Math.Abs(result.AngleRadians * 180 / Math.PI + degrees) < 0.2, "Returned angle changed convention.");
             return string.Format("PASS: rotation {0} deg, scale {1}, center error {2:F3}px, contour distance {3:F3}px",
                 degrees, scale, positionError, distance);
+        }
+    }
+
+    private static Bitmap CreateGrayscale8bppBitmap(int width, int height, PointF[] polygon, byte bgGray, byte fgGray)
+    {
+        using (var rgb = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+        using (var g = Graphics.FromImage(rgb))
+        using (var bgBrush = new SolidBrush(Color.FromArgb(bgGray, bgGray, bgGray)))
+        using (var fgBrush = new SolidBrush(Color.FromArgb(fgGray, fgGray, fgGray)))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.FillRectangle(bgBrush, 0, 0, width, height);
+            g.FillPolygon(fgBrush, polygon);
+            var indexed = new Bitmap(width, height, PixelFormat.Format8bppIndexed);
+            var palette = indexed.Palette;
+            for (int i = 0; i < 256; i++) palette.Entries[i] = Color.FromArgb(i, i, i);
+            indexed.Palette = palette;
+            var srcData = rgb.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+            var dstData = indexed.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format8bppIndexed);
+            try
+            {
+                byte[] srcRow = new byte[Math.Abs(srcData.Stride)];
+                byte[] dstRow = new byte[width];
+                for (int y = 0; y < height; y++)
+                {
+                    System.Runtime.InteropServices.Marshal.Copy(IntPtr.Add(srcData.Scan0, y * srcData.Stride), srcRow, 0, srcRow.Length);
+                    for (int x = 0; x < width; x++) dstRow[x] = srcRow[x * 3];
+                    System.Runtime.InteropServices.Marshal.Copy(dstRow, 0, IntPtr.Add(dstData.Scan0, y * dstData.Stride), width);
+                }
+            }
+            finally
+            {
+                rgb.UnlockBits(srcData);
+                indexed.UnlockBits(dstData);
+            }
+            return indexed;
+        }
+    }
+
+    public static string AutoThresholdAndStability()
+    {
+        var defaults = new MarkMatchParameters();
+        Require(defaults.AutoEdgeThreshold, "AutoEdgeThreshold must default to true.");
+        using (var lowContrastTeach = CreateGrayscale8bppBitmap(640, 480, Polygon(320, 240, 0, 1), 135, 110))
+        using (var lowContrastTest = CreateGrayscale8bppBitmap(641, 480, Polygon(345, 222, 4, 0.98), 132, 112))
+        using (var odd24 = new Bitmap(641, 480, PixelFormat.Format24bppRgb))
+        using (var control = new MarkSetupControl())
+        {
+            using (var g = Graphics.FromImage(odd24)) g.DrawImageUnscaled(lowContrastTest, 0, 0);
+            var job = new MarkLocateJob
+            {
+                TemplateRoiShape = RegionShape.Rectangle,
+                TemplateRoi = new RectangleF(210, 130, 220, 220),
+                SearchRoiEnabled = false
+            };
+            control.LoadConfiguration(lowContrastTeach, job);
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var type = typeof(MarkSetupControl);
+            var chkAuto = (CheckBox)type.GetField("chkAutoThreshold", flags).GetValue(control);
+            var numLow = (NumericUpDown)type.GetField("numEdgeLow", flags).GetValue(control);
+            var numHigh = (NumericUpDown)type.GetField("numEdgeHigh", flags).GetValue(control);
+            Require(chkAuto.Checked, "Setup UI auto-threshold checkbox must default to checked.");
+            Require(control.Job.TeachData.FeaturePoints.Count > 40,
+                "HALCON auto threshold failed on low-contrast image (points=" + control.Job.TeachData.FeaturePoints.Count + ").");
+            Require(chkAuto.Checked && (double)numHigh.Value < 15.0 && (double)numLow.Value < (double)numHigh.Value,
+                "Auto threshold did not adapt down for low-contrast image: " + numLow.Value + "/" + numHigh.Value);
+
+            bool taught = false;
+            control.TeachCompleted += (s, e) => taught = true;
+            type.GetMethod("btnTeach_Click", flags).Invoke(control, new object[] { null, EventArgs.Empty });
+            WaitFor(() => taught, "Low-contrast auto-threshold teach timed out.");
+
+            var sdk = new MarkLocatorSdk();
+            var result8bpp = sdk.RunInspection(lowContrastTest, control.Job, false);
+            Require(result8bpp.Success && result8bpp.Score >= 0.70,
+                "8bpp low-contrast matching failed: " + result8bpp.Message);
+            Require(Math.Abs(result8bpp.ModelPoint.X - 345) < 1.0 && Math.Abs(result8bpp.ModelPoint.Y - 222) < 1.0,
+                "8bpp low-contrast center error too large: " + result8bpp.ModelPoint);
+
+            var resultOdd24 = sdk.RunInspection(odd24, control.Job, false);
+            Require(resultOdd24.Success && Math.Abs(resultOdd24.ModelPoint.X - 345) < 1.0 && Math.Abs(resultOdd24.ModelPoint.Y - 222) < 1.0,
+                "Odd-width 24bpp stride test shifted: " + resultOdd24.ModelPoint);
+
+            return string.Format("PASS: auto threshold ({0:F1}/{1:F1}), 8bpp & odd-width 24bpp low-contrast score {2:F3}",
+                numLow.Value, numHigh.Value, resultOdd24.Score);
+        }
+    }
+
+    public static string HalconCircleAndResultImage()
+    {
+        using (var teachCircle = new Bitmap(320, 240, PixelFormat.Format32bppRgb))
+        using (var testCircle = new Bitmap(320, 240, PixelFormat.Format32bppRgb))
+        {
+            using (var g = Graphics.FromImage(teachCircle))
+            using (var brush = new SolidBrush(Color.FromArgb(40, 40, 40)))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(Color.FromArgb(205, 205, 205));
+                g.FillEllipse(brush, 125f, 85f, 70f, 70f); // center=(160, 120), r=35
+            }
+            using (var g = Graphics.FromImage(testCircle))
+            using (var brush = new SolidBrush(Color.FromArgb(40, 40, 40)))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(Color.FromArgb(205, 205, 205));
+                g.FillEllipse(brush, 133f, 77f, 70f, 70f); // center=(168, 112), r=35
+            }
+
+            var job = new MarkLocateJob
+            {
+                EnableTemplateMatching = false,
+                EnableCircleDetection = true,
+                SearchRoiEnabled = true,
+                SearchRoi = new RectangleF(100, 55, 140, 130)
+            };
+            job.Parameters.ExpectedCircleRadius = 34.0;
+            var sdk = new MarkLocatorSdk();
+            var result = sdk.RunInspection(testCircle, job, true);
+            using (var overlay = result.ResultImage)
+            {
+                Require(result.Success && result.CircleFound, "HALCON Metrology circle-only detection failed: " + result.Message);
+                Require(Math.Abs(result.CirclePoint.X - 168f) < 1.0f && Math.Abs(result.CirclePoint.Y - 112f) < 1.0f,
+                    "HALCON circle center error: " + result.CirclePoint);
+                Require(Math.Abs(result.CircleRadius - 35f) < 1.0f, "HALCON circle radius error: " + result.CircleRadius);
+                Require(overlay != null && overlay.PixelFormat == PixelFormat.Format24bppRgb, "HALCON ResultImage format invalid.");
+                bool hasOrange = false;
+                for (int y = 70; y < 160 && !hasOrange; y++)
+                    for (int x = 125; x < 215 && !hasOrange; x++)
+                    {
+                        var px = overlay.GetPixel(x, y);
+                        if (px.R > 180 && px.G > 100 && px.B < 80) hasOrange = true;
+                    }
+                Require(hasOrange, "HALCON ResultImage did not render orange circle overlay.");
+            }
+
+            // Combined template match + HALCON Metrology circle refinement
+            var combinedJob = new MarkLocateJob
+            {
+                TemplateRoiShape = RegionShape.Circle,
+                TemplateRoi = new RectangleF(110, 70, 100, 100),
+                EnableTemplateMatching = true,
+                EnableCircleDetection = true,
+                SearchRoiEnabled = false
+            };
+            combinedJob.Parameters.ExpectedCircleRadius = 35.0;
+            combinedJob.TeachData = new HalconMarkLocator().Teach(teachCircle, combinedJob);
+            var combinedResult = sdk.RunInspection(testCircle, combinedJob, false);
+            Require(combinedResult.Success && combinedResult.CircleFound,
+                "Combined template + HALCON Metrology refinement failed: " + combinedResult.Message);
+            Require(Math.Abs(combinedResult.CirclePoint.X - 168f) < 1.0f && Math.Abs(combinedResult.CirclePoint.Y - 112f) < 1.0f,
+                "Combined circle center error: " + combinedResult.CirclePoint);
+
+            return string.Format("PASS: HALCON Metrology circle ({0:F2}, {1:F2}, R={2:F2}) & HALCON result overlay",
+                combinedResult.CirclePoint.X, combinedResult.CirclePoint.Y, combinedResult.CircleRadius);
+        }
+    }
+
+    public static string PageTestMatchesSdkRunAndDDriveLogging()
+    {
+        var teachImg = CreateGrayscale8bppBitmap(640, 480, Polygon(320, 240, 0, 1), 225, 30);
+        var testImg = CreateGrayscale8bppBitmap(640, 480, Polygon(348, 226, 3, 1.01), 225, 30);
+        using (teachImg)
+        using (testImg)
+        using (var control = new MarkSetupControl())
+        {
+            var job = new MarkLocateJob
+            {
+                TemplateRoiShape = RegionShape.Rectangle,
+                TemplateRoi = new RectangleF(210, 130, 220, 220),
+                SearchRoiEnabled = false
+            };
+            control.LoadConfiguration(teachImg, job);
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var type = typeof(MarkSetupControl);
+            bool taught = false;
+            control.TeachCompleted += (s, e) => taught = true;
+            type.GetMethod("btnTeach_Click", flags).Invoke(control, new object[] { null, EventArgs.Empty });
+            WaitFor(() => taught, "Teach did not complete.");
+
+            control.LoadImage(testImg);
+            bool tested = false;
+            MarkLocateResult pageResult = null;
+            control.TestCompleted += (s, e) => { tested = true; pageResult = e.Result; };
+            type.GetMethod("btnTest_Click", flags).Invoke(control, new object[] { null, EventArgs.Empty });
+            WaitFor(() => tested, "Page test did not complete.");
+
+            var sdkResult = new MarkLocatorSdk().RunInspection(testImg, control.Job, false);
+            Require(pageResult != null && pageResult.Success && sdkResult.Success, "Page or SDK inspection failed.");
+            Require(Math.Abs(pageResult.Score - sdkResult.Score) < 1e-6,
+                "Page test score differs from SDK RunInspection: " + pageResult.Score + " vs " + sdkResult.Score);
+            Require(Math.Abs(pageResult.ModelPoint.X - sdkResult.ModelPoint.X) < 1e-4 &&
+                    Math.Abs(pageResult.ModelPoint.Y - sdkResult.ModelPoint.Y) < 1e-4 &&
+                    Math.Abs(pageResult.AngleRadians - sdkResult.AngleRadians) < 1e-6 &&
+                    Math.Abs(pageResult.Scale - sdkResult.Scale) < 1e-6,
+                "Page test coordinates/pose differ from SDK RunInspection.");
+
+            if (System.IO.Directory.Exists(@"D:\"))
+            {
+                string logPath = System.IO.Path.Combine(@"D:\", string.Format("MarkVision_RunLog_{0:yyyyMMdd}.log", DateTime.Now));
+                Require(System.IO.File.Exists(logPath), "D:\\ root log file was not created: " + logPath);
+                string content = System.IO.File.ReadAllText(logPath, System.Text.Encoding.UTF8);
+                Require(content.Contains("来源=页面测试") && content.Contains("来源=上位机SDK") && content.Contains("分数="),
+                    "D:\\ log is missing page test / SDK run / score entries.");
+            }
+            return string.Format("PASS: page test matches SDK RunInspection (score {0:F4}) and D:\\ root logging verified", sdkResult.Score);
+        }
+    }
+
+    public static string RoiInteractionResponsiveness()
+    {
+        using (var form = new Form { Size = new Size(1180, 808) })
+        using (var control = new MarkSetupControl { Dock = DockStyle.Fill })
+        using (var largeImage = new Bitmap(2048, 1536, PixelFormat.Format24bppRgb))
+        {
+            using (var g = Graphics.FromImage(largeImage))
+            using (var pen = new Pen(Color.Black, 4))
+            {
+                g.Clear(Color.FromArgb(220, 220, 220));
+                var poly = Polygon(1024, 768, 0, 1.2);
+                g.FillPolygon(Brushes.White, poly);
+                g.DrawPolygon(pen, poly);
+            }
+            form.Controls.Add(control);
+            control.LoadImage(largeImage);
+            form.Show();
+            Application.DoEvents();
+
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var type = typeof(MarkSetupControl);
+            var canvas = (MaskImageCanvas)type.GetField("canvas", flags).GetValue(control);
+            var btnTpl = (ToolStripButton)type.GetField("btnTemplateRoi", flags).GetValue(control);
+            btnTpl.PerformClick();
+            Require(canvas.TemplateRoiShape == RegionShape.Rectangle, "Default ROI shape on draw must be Rectangle.");
+
+            canvas.ActualSize();
+            var pan = (PointF)typeof(MaskImageCanvas).GetField("_pan", flags).GetValue(canvas);
+            var down = typeof(Control).GetMethod("OnMouseDown", flags);
+            var move = typeof(Control).GetMethod("OnMouseMove", flags);
+            var up = typeof(Control).GetMethod("OnMouseUp", flags);
+
+            int sx = (int)(900 + pan.X), sy = (int)(650 + pan.Y);
+            down.Invoke(canvas, new object[] { new MouseEventArgs(MouseButtons.Left, 1, sx, sy, 0) });
+            var dragTimer = System.Diagnostics.Stopwatch.StartNew();
+            double maxMoveMs = 0;
+            for (int i = 1; i <= 20; i++)
+            {
+                var step = System.Diagnostics.Stopwatch.StartNew();
+                move.Invoke(canvas, new object[] { new MouseEventArgs(MouseButtons.Left, 0, sx + i * 12, sy + i * 12, 0) });
+                canvas.Update();
+                step.Stop();
+                maxMoveMs = Math.Max(maxMoveMs, step.Elapsed.TotalMilliseconds);
+            }
+            dragTimer.Stop();
+
+            var releaseTimer = System.Diagnostics.Stopwatch.StartNew();
+            up.Invoke(canvas, new object[] { new MouseEventArgs(MouseButtons.Left, 1, sx + 240, sy + 240, 0) });
+            releaseTimer.Stop();
+
+            Require(canvas.TemplateRoi.Width == 240 && canvas.TemplateRoi.Height == 240,
+                "Drawn rectangle ROI size incorrect: " + canvas.TemplateRoi);
+            Require(control.Job.TeachData.FeaturePoints.Count > 40,
+                "Feature extraction after ROI release produced too few points.");
+            double avgMoveMs = dragTimer.Elapsed.TotalMilliseconds / 20.0;
+            Require(avgMoveMs < 25.0 && releaseTimer.Elapsed.TotalMilliseconds < 400.0,
+                string.Format("ROI interaction too slow: avgMove={0:F2}ms, releaseExtract={1:F2}ms", avgMoveMs, releaseTimer.Elapsed.TotalMilliseconds));
+
+            form.Close();
+            return string.Format("PASS: 2048x1536 rectangle ROI drag avg {0:F2} ms/move (max {1:F2} ms), release extract {2:F2} ms",
+                avgMoveMs, maxMoveMs, releaseTimer.Elapsed.TotalMilliseconds);
         }
     }
 }

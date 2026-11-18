@@ -1,9 +1,10 @@
 using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
+using System.Globalization;
+using System.IO;
 using System.Runtime.ExceptionServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -33,11 +34,33 @@ namespace Seprays.MarkVision
 
 		public MarkLocateResult RunInspection(Bitmap image, MarkLocateJob job, bool returnResultImage = false)
 		{
-			if (image == null) return MarkLocateResult.Failed("待检测图片为空。");
-			MarkLocateResult result = job == null
-				? MarkLocateResult.Failed("Mark 定位 Job 为空。")
-				: new HalconMarkLocator().Locate(image, job);
-			if (returnResultImage) result.ResultImage = RenderResultImage(image, result);
+			double elapsedMilliseconds;
+			return RunInspectionCore(image, job, returnResultImage, "上位机SDK", out elapsedMilliseconds);
+		}
+
+		internal MarkLocateResult RunInspectionCore(Bitmap image, MarkLocateJob job, bool returnResultImage, string callerSource, out double elapsedMilliseconds)
+		{
+			Stopwatch timer = Stopwatch.StartNew();
+			MarkLocateResult result;
+			if (image == null)
+			{
+				result = MarkLocateResult.Failed("待检测图片为空。");
+			}
+			else if (job == null)
+			{
+				result = MarkLocateResult.Failed("Mark 定位 Job 为空。");
+			}
+			else
+			{
+				result = new HalconMarkLocator().Locate(image, job);
+			}
+			if (returnResultImage && image != null)
+			{
+				result.ResultImage = HalconMarkLocator.RenderResultImageWithHalcon(image, result);
+			}
+			timer.Stop();
+			elapsedMilliseconds = timer.Elapsed.TotalMilliseconds;
+			MarkInspectionLogger.LogInspection(callerSource, image, job, result, elapsedMilliseconds);
 			return result;
 		}
 
@@ -46,63 +69,116 @@ namespace Seprays.MarkVision
 			using (MarkSetupForm form = new MarkSetupForm(image, currentJob))
 				return form.ShowDialog() == DialogResult.OK ? form.Job?.DeepClone() : null;
 		}
+	}
 
-		private static Bitmap RenderResultImage(Bitmap source, MarkLocateResult result)
+	internal static class MarkInspectionLogger
+	{
+		private static readonly object SyncRoot = new object();
+		private static readonly Encoding Utf8WithBom = new UTF8Encoding(true);
+		private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+
+		internal static string GetLogFilePath(DateTime timestamp)
 		{
-			// Explicitly use a drawable format, including for indexed camera images.
-			Bitmap image = new Bitmap(source.Width, source.Height, PixelFormat.Format24bppRgb);
+			return Path.Combine(@"D:\", string.Format(CultureInfo.InvariantCulture, "MarkVision_RunLog_{0:yyyyMMdd}.log", timestamp));
+		}
+
+		internal static void LogInspection(string callerSource, Bitmap image, MarkLocateJob job, MarkLocateResult result, double elapsedMilliseconds)
+		{
+			DateTime now = DateTime.Now;
+			string imageInfo = image == null ? "null" : $"{image.Width}x{image.Height}({image.PixelFormat})";
+			MarkMatchParameters p = job?.Parameters;
+			string paramInfo = job == null
+				? "Job=null"
+				: string.Format(
+					CultureInfo.InvariantCulture,
+					"Tpl={0} Circle={1} SearchRoi={2} AutoThresh={3}(Low={4:F1},High={5:F1}) Polarity={6} MinScore={7:F2} Greed={8:F2}",
+					job.EnableTemplateMatching,
+					job.EnableCircleDetection,
+					job.SearchRoiEnabled,
+					p?.AutoEdgeThreshold ?? false,
+					p?.EdgeLowThreshold ?? 0.0,
+					p?.EdgeHighThreshold ?? 0.0,
+					p == null ? "-" : (p.UsePolarity ? "IgnoreLocal" : "IgnoreGlobal"),
+					p?.MinScore ?? 0.0,
+					p?.Greediness ?? 0.0);
+
+			bool success = result != null && result.Success;
+			double score = result?.Score ?? 0.0;
+			double x = result?.ModelPoint.X ?? 0.0;
+			double y = result?.ModelPoint.Y ?? 0.0;
+			double angleDeg = result != null ? result.AngleRadians * 180.0 / Math.PI : 0.0;
+			double scale = result?.Scale ?? 1.0;
+			string circleInfo = result != null && result.CircleFound
+				? string.Format(CultureInfo.InvariantCulture, "True({0:F3},{1:F3},R={2:F2})", result.CirclePoint.X, result.CirclePoint.Y, result.CircleRadius)
+				: "False";
+			string message = (result?.Message ?? string.Empty).Replace("\r", " ").Replace("\n", " ");
+
+			string line = string.Format(
+				CultureInfo.InvariantCulture,
+				"[{0:yyyy-MM-dd HH:mm:ss.fff}] [定位] 来源={1} TID={2} 图像={3} 结果={4} 分数={5:F4} 坐标=({6:F3},{7:F3}) 角度={8:F3}° 缩放={9:F4} 找圆={10} 耗时={11:F2}ms {12} 说明={13}",
+				now,
+				string.IsNullOrEmpty(callerSource) ? "未知" : callerSource,
+				Thread.CurrentThread.ManagedThreadId,
+				imageInfo,
+				success ? "成功" : "失败",
+				score,
+				x,
+				y,
+				angleDeg,
+				scale,
+				circleInfo,
+				elapsedMilliseconds,
+				paramInfo,
+				message);
+			WriteLine(now, line);
+		}
+
+		internal static void LogTeach(string callerSource, Bitmap image, MarkLocateJob job, int featureCount, bool success, double elapsedMilliseconds, string message)
+		{
+			DateTime now = DateTime.Now;
+			string imageInfo = image == null ? "null" : $"{image.Width}x{image.Height}({image.PixelFormat})";
+			MarkMatchParameters p = job?.Parameters;
+			string cleanMessage = (message ?? string.Empty).Replace("\r", " ").Replace("\n", " ");
+			string line = string.Format(
+				CultureInfo.InvariantCulture,
+				"[{0:yyyy-MM-dd HH:mm:ss.fff}] [建模] 来源={1} TID={2} 图像={3} 结果={4} 特征点={5} AutoThresh={6}(Low={7:F1},High={8:F1}) MinContrast={9} 耗时={10:F2}ms 说明={11}",
+				now,
+				string.IsNullOrEmpty(callerSource) ? "未知" : callerSource,
+				Thread.CurrentThread.ManagedThreadId,
+				imageInfo,
+				success ? "成功" : "失败",
+				featureCount,
+				p?.AutoEdgeThreshold ?? false,
+				p?.EdgeLowThreshold ?? 0.0,
+				p?.EdgeHighThreshold ?? 0.0,
+				p?.MinContrast ?? 0,
+				elapsedMilliseconds,
+				cleanMessage);
+			WriteLine(now, line);
+		}
+
+		private static void WriteLine(DateTime timestamp, string line)
+		{
 			try
 			{
-				using (Graphics graphics = Graphics.FromImage(image))
-				using (Pen contourPen = new Pen(Color.DeepSkyBlue, 2f))
-				using (Pen centerPen = new Pen(Color.LimeGreen, 2f))
-				using (Pen circlePen = new Pen(Color.Orange, 2f))
+				if (!Directory.Exists(@"D:\"))
 				{
-					graphics.DrawImageUnscaled(source, 0, 0);
-					graphics.SmoothingMode = SmoothingMode.AntiAlias;
-					bool hasContours = false;
-					foreach (List<PointF> contour in result.MatchedContours ?? new List<List<PointF>>())
+					return;
+				}
+				string path = GetLogFilePath(timestamp);
+				lock (SyncRoot)
+				{
+					bool isNew = !File.Exists(path);
+					using (StreamWriter writer = new StreamWriter(path, append: true, encoding: isNew ? Utf8WithBom : Utf8NoBom))
 					{
-						if (contour == null) continue;
-						PointF? previous = null;
-						foreach (PointF point in contour)
-						{
-							if (!IsFinite(point)) { previous = null; continue; }
-							hasContours = true;
-							if (previous.HasValue) graphics.DrawLine(contourPen, previous.Value, point);
-							previous = point;
-						}
-					}
-					if (result.Success || hasContours) DrawCross(graphics, centerPen, result.ModelPoint);
-					if (result.CircleFound && IsFinite(result.CirclePoint) &&
-						result.CircleRadius > 0 && !float.IsInfinity(result.CircleRadius))
-					{
-						float radius = result.CircleRadius;
-						graphics.DrawEllipse(circlePen, result.CirclePoint.X - radius,
-							result.CirclePoint.Y - radius, radius * 2, radius * 2);
-						DrawCross(graphics, circlePen, result.CirclePoint);
+						writer.WriteLine(line);
 					}
 				}
-				return image;
 			}
 			catch
 			{
-				image.Dispose();
-				throw;
+				// Never break production inspection if disk logging is unavailable.
 			}
-		}
-
-		private static void DrawCross(Graphics graphics, Pen pen, PointF point)
-		{
-			if (!IsFinite(point)) return;
-			graphics.DrawLine(pen, point.X - 10, point.Y, point.X + 10, point.Y);
-			graphics.DrawLine(pen, point.X, point.Y - 10, point.X, point.Y + 10);
-		}
-
-		private static bool IsFinite(PointF point)
-		{
-			return !float.IsNaN(point.X) && !float.IsInfinity(point.X) &&
-				!float.IsNaN(point.Y) && !float.IsInfinity(point.Y);
 		}
 	}
 }

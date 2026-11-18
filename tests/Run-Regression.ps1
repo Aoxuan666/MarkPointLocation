@@ -2,7 +2,12 @@ param([switch]$SkipBuild)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $SkipBuild) {
-    dotnet build (Join-Path $root 'MarkPointLocation.sln') -c Release -p:Platform=x64 --nologo
+    $msbuild = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
+    if (Test-Path $msbuild) {
+        & $msbuild (Join-Path $root 'MarkPointLocation.sln') /p:Configuration=Release /p:Platform=x64 /nologo /v:minimal
+    } else {
+        dotnet build (Join-Path $root 'MarkPointLocation.sln') -c Release -p:Platform=x64 --nologo
+    }
     if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 }
 if (-not [Environment]::Is64BitProcess) { throw 'Run this script in x64 Windows PowerShell.' }
@@ -30,3 +35,7 @@ Add-Type -TypeDefinition ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Regre
 [RegressionChecks]::Rotation(0, 1)
 [RegressionChecks]::Rotation(20, 1.04)
 [RegressionChecks]::Rotation(-20, 0.96)
+[RegressionChecks]::AutoThresholdAndStability()
+[RegressionChecks]::HalconCircleAndResultImage()
+[RegressionChecks]::PageTestMatchesSdkRunAndDDriveLogging()
+[RegressionChecks]::RoiInteractionResponsiveness()

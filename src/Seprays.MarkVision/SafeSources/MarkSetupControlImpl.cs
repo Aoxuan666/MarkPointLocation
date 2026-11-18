@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Threading.Tasks;
@@ -90,6 +89,8 @@ namespace Seprays.MarkVision
 		private Label lblTemplateMean;
 
 		private Label lblEdgeSigma;
+
+		private CheckBox chkAutoThreshold;
 
 		private Label lblEdgeLow;
 
@@ -230,15 +231,15 @@ namespace Seprays.MarkVision
 			}
 			if (sourceImage == null)
 			{
-				throw new ArgumentNullException("sourceImage");
+				throw new ArgumentNullException(nameof(sourceImage));
 			}
 			_loading = true;
 			try
 			{
 				_sourceImage?.Dispose();
-				_sourceImage = new Bitmap(sourceImage);
+				_sourceImage = CloneBitmapPreserveFormat(sourceImage);
 				_templateImage?.Dispose();
-				_templateImage = new Bitmap(sourceImage);
+				_templateImage = CloneBitmapPreserveFormat(sourceImage);
 				_currentImageIsTemplate = true;
 				_job = currentJob?.DeepClone() ?? new MarkLocateJob();
 				_job.Normalize(_sourceImage.Size);
@@ -329,10 +330,10 @@ namespace Seprays.MarkVision
 			}
 			if (image == null)
 			{
-				throw new ArgumentNullException("image");
+				throw new ArgumentNullException(nameof(image));
 			}
 			_sourceImage?.Dispose();
-			_sourceImage = new Bitmap(image);
+			_sourceImage = CloneBitmapPreserveFormat(image);
 			_currentImageIsTemplate = false;
 			DisplayImage(_sourceImage);
 			canvas.ShowTemplateOverlay = false;
@@ -402,14 +403,16 @@ namespace Seprays.MarkVision
 		{
 			if (_sourceImage == null) return;
 			_templateImage?.Dispose();
-			_templateImage = new Bitmap(_sourceImage);
+			_templateImage = CloneBitmapPreserveFormat(_sourceImage);
 			_currentImageIsTemplate = true;
 			DisplayImage(_sourceImage);
 			canvas.ShowTemplateOverlay = true;
+			_rawFeaturePoints.Clear();
+			canvas.FeaturePoints = _rawFeaturePoints;
 			canvas.TemplateRoi = RectangleF.Empty;
 			canvas.ClearMask();
+			InvalidateTeachModel("按住左键绘制模板 ROI；绘制后拖动内部平移、拖动手柄缩放。", notifyChanged: false);
 			SetInteractionMode(CanvasInteractionMode.EditTemplateRoi);
-			SetStatus("按住左键绘制模板 ROI；绘制后拖动内部平移、拖动手柄缩放。");
 		}
 
 		private void btnSearchRoi_Click(object sender, EventArgs e)
@@ -507,18 +510,15 @@ namespace Seprays.MarkVision
 			try
 			{
 				MarkLocateJob workJob = _job.DeepClone();
-				Bitmap workImage = new Bitmap(_templateImage);
+				Bitmap workImage = CloneBitmapPreserveFormat(_templateImage);
 				MarkTeachData teachData;
 				try
 				{
-					teachData = await Task.Run(() => _locator.Teach(workImage, workJob));
+					teachData = await Task.Run(() => _locator.TeachCore(workImage, workJob, "页面建模"));
 				}
 				finally
 				{
-					if (workImage != null)
-					{
-						((IDisposable)workImage).Dispose();
-					}
+					workImage?.Dispose();
 				}
 				if (IsDisposed || Disposing)
 				{
@@ -560,46 +560,37 @@ namespace Seprays.MarkVision
 				SetStatus("请先加载图片，再执行测试定位。");
 				return;
 			}
-			Bitmap inspectionImage = _sourceImage;
-			PullControlsToJob();
-			if (_job.EnableTemplateMatching && !_job.TeachData.HasModel)
-			{
-				MessageBox.Show(this, "请先创建外轮廓模板。", "测试定位", MessageBoxButtons.OK, MessageBoxIcon.Asterisk);
-				return;
-			}
+			// Prepare Job and image identically to the host SDK RunInspection flow.
+			MarkLocateJob workJob = Job;
+			Bitmap workImage = CloneBitmapPreserveFormat(_sourceImage);
 			ShowTestImage();
 			SetBusy(busy: true, "正在测试定位...");
 			canvas.ClearInspectionResult();
 			canvas.MatchedContours = new List<List<PointF>>();
 			try
 			{
-				MarkLocateJob workJob = _job.DeepClone();
-				Bitmap workImage = new Bitmap(inspectionImage);
 				MarkLocateResult result;
-				var timer = new Stopwatch();
+				double elapsedMilliseconds = 0.0;
 				try
 				{
 					result = await Task.Run(() =>
 					{
-						timer.Start();
-						var inspectionResult = _sdk.RunInspection(workImage, workJob);
-						timer.Stop();
+						double elapsed;
+						var inspectionResult = _sdk.RunInspectionCore(workImage, workJob, false, "页面测试", out elapsed);
+						elapsedMilliseconds = elapsed;
 						return inspectionResult;
 					});
 				}
 				finally
 				{
-					if (workImage != null)
-					{
-						((IDisposable)workImage).Dispose();
-					}
+					workImage?.Dispose();
 				}
 				if (IsDisposed || Disposing)
 				{
 					return;
 				}
 				canvas.MatchedContours = result.MatchedContours;
-				canvas.ShowInspectionResult(result, timer.Elapsed.TotalMilliseconds);
+				canvas.ShowInspectionResult(result, elapsedMilliseconds);
 				SetStatus(result.Message);
 				this.TestCompleted?.Invoke(this, new MarkLocateCompletedEventArgs(result));
 			}
@@ -618,9 +609,12 @@ namespace Seprays.MarkVision
 			{
 				_job.TemplateRoi = canvas.TemplateRoi;
 				_job.TemplateRoiShape = canvas.TemplateRoiShape;
-				_rawFeaturePoints.Clear();
-				canvas.FeaturePoints = _rawFeaturePoints;
-				InvalidateTeachModel("模板 ROI 已修改，松开鼠标后自动提取特征点。", notifyChanged: false);
+				if (_rawFeaturePoints.Count > 0 || _job.TeachData.HasModel || canvas.MatchedContours.Count > 0 || canvas.ModelContours.Count > 0)
+				{
+					_rawFeaturePoints.Clear();
+					canvas.FeaturePoints = _rawFeaturePoints;
+					InvalidateTeachModel("模板 ROI 已修改，松开鼠标后自动提取特征点。", notifyChanged: false);
+				}
 			}
 		}
 
@@ -633,6 +627,19 @@ namespace Seprays.MarkVision
 		}
 
 		private void canvas_SearchRoiChanged(object sender, EventArgs e)
+		{
+			if (!_loading)
+			{
+				_job.SearchRoi = canvas.SearchRoi;
+				if (!canvas.Capture)
+				{
+					SetStatus("搜索区域已更新。");
+					this.JobChanged?.Invoke(this, EventArgs.Empty);
+				}
+			}
+		}
+
+		private void canvas_SearchRoiEditCompleted(object sender, EventArgs e)
 		{
 			if (!_loading)
 			{
@@ -670,6 +677,10 @@ namespace Seprays.MarkVision
 			if (!_loading)
 			{
 				_loading = true;
+				if (sender == numEdgeLow || sender == numEdgeHigh)
+				{
+					chkAutoThreshold.Checked = false;
+				}
 				if (sender == numEdgeLow && numEdgeHigh.Value <= numEdgeLow.Value)
 					numEdgeHigh.Value = numEdgeLow.Value + 1m;
 				if (sender == numEdgeHigh && numEdgeLow.Value >= numEdgeHigh.Value)
@@ -746,12 +757,32 @@ namespace Seprays.MarkVision
 				{
 					InvalidateTeachModel("正在重新提取特征点...", notifyChanged: false);
 				}
-				_rawFeaturePoints = _locator.ExtractFeaturePoints(_templateImage, _job);
+				double appliedLow;
+				double appliedHigh;
+				_rawFeaturePoints = _locator.ExtractFeaturePointsCore(_templateImage, _job, out appliedLow, out appliedHigh);
+				if (_job.Parameters.AutoEdgeThreshold)
+				{
+					_job.Parameters.EdgeLowThreshold = appliedLow;
+					_job.Parameters.EdgeHighThreshold = appliedHigh;
+					_loading = true;
+					try
+					{
+						SetNumericValue(numEdgeLow, appliedLow);
+						SetNumericValue(numEdgeHigh, appliedHigh);
+					}
+					finally
+					{
+						_loading = false;
+					}
+				}
 				ShowTeachingImage();
 				canvas.FeaturePoints = _rawFeaturePoints;
 				UpdateVisibleFeaturePoints();
 				int pointCount = CountRealPoints(_job.TeachData.FeaturePoints);
-				string status = ((pointCount > 0) ? $"已自动提取 {pointCount} 个外轮廓特征点，可绘制区域掩膜排除不稳定区域。" : "没有提取到特征点，请调整模板 ROI 或边缘参数。");
+				string threshNote = _job.Parameters.AutoEdgeThreshold
+					? $"（自动阈值 {appliedLow:F1}/{appliedHigh:F1}）"
+					: string.Empty;
+				string status = ((pointCount > 0) ? $"已自动提取 {pointCount} 个外轮廓特征点{threshNote}，可绘制区域掩膜排除不稳定区域。" : $"没有提取到特征点{threshNote}，请调整模板 ROI 或边缘参数。");
 				SetStatus(status);
 				if (showMessage && pointCount == 0)
 				{
@@ -774,6 +805,7 @@ namespace Seprays.MarkVision
 			MarkMatchParameters parameters = _job.Parameters ?? new MarkMatchParameters();
 			SetNumericValue(numTemplateMean, parameters.TemplateMeanSize);
 			SetNumericValue(numEdgeSigma, parameters.EdgeSigma);
+			chkAutoThreshold.Checked = parameters.AutoEdgeThreshold;
 			SetNumericValue(numEdgeLow, parameters.EdgeLowThreshold);
 			SetNumericValue(numEdgeHigh, parameters.EdgeHighThreshold);
 			SetNumericValue(numFeatureDistance, parameters.FeatureMinDistancePx);
@@ -791,7 +823,7 @@ namespace Seprays.MarkVision
 			SetNumericValue(numScaleMax, parameters.ScaleMax);
 			SetNumericValue(numMaxOverlap, parameters.MaxOverlap);
 			SetNumericValue(numGreediness, parameters.Greediness);
-			chkCircleRefinement.Checked = parameters.EnableCircleRefinement;
+			chkCircleRefinement.Checked = _job.EnableCircleDetection || parameters.EnableCircleRefinement;
 			chkRequireCircle.Checked = parameters.RequireCircleRefinement;
 			SetNumericValue(numCircleRadius, parameters.ExpectedCircleRadius);
 			UpdateCircleParameterState();
@@ -812,6 +844,7 @@ namespace Seprays.MarkVision
 			MarkMatchParameters parameters = _job.Parameters;
 			parameters.TemplateMeanSize = decimal.ToInt32(numTemplateMean.Value);
 			parameters.EdgeSigma = (double)numEdgeSigma.Value;
+			parameters.AutoEdgeThreshold = chkAutoThreshold.Checked;
 			parameters.EdgeLowThreshold = (double)numEdgeLow.Value;
 			parameters.EdgeHighThreshold = (double)numEdgeHigh.Value;
 			parameters.FeatureMinDistancePx = (double)numFeatureDistance.Value;
@@ -940,6 +973,11 @@ namespace Seprays.MarkVision
 			this.StatusChanged?.Invoke(this, EventArgs.Empty);
 		}
 
+		private static Bitmap CloneBitmapPreserveFormat(Bitmap source)
+		{
+			return source.Clone(new Rectangle(0, 0, source.Width, source.Height), source.PixelFormat);
+		}
+
 		private static int CountRealPoints(IEnumerable<PointF> points)
 		{
 			return points?.Count((PointF point) => !float.IsNaN(point.X) && !float.IsNaN(point.Y)) ?? 0;
@@ -1038,6 +1076,7 @@ namespace Seprays.MarkVision
 			this.grpFeature = new System.Windows.Forms.GroupBox();
 			this.lblTemplateMean = new System.Windows.Forms.Label();
 			this.lblEdgeSigma = new System.Windows.Forms.Label();
+			this.chkAutoThreshold = new System.Windows.Forms.CheckBox();
 			this.lblEdgeLow = new System.Windows.Forms.Label();
 			this.lblEdgeHigh = new System.Windows.Forms.Label();
 			this.lblFeatureDistance = new System.Windows.Forms.Label();
@@ -1108,10 +1147,10 @@ namespace Seprays.MarkVision
 			this.toolMain.Size = new System.Drawing.Size(1180, 35);
 			this.toolMain.TabIndex = 0;
 			this.btnTemplateShape.Name = "btnTemplateShape";
-			this.btnTemplateShape.Text = "模板形状: 圆形";
-			this.btnTemplateShape.ToolTipText = "选择模板 ROI 形状（默认圆形）";
-			this.btnTemplateShape.DropDownItems.Add(CreateShapeMenuItem("圆形", RegionShape.Circle, templateShape_Click));
+			this.btnTemplateShape.Text = "模板形状: 矩形";
+			this.btnTemplateShape.ToolTipText = "选择模板 ROI 形状（默认矩形）";
 			this.btnTemplateShape.DropDownItems.Add(CreateShapeMenuItem("矩形", RegionShape.Rectangle, templateShape_Click));
+			this.btnTemplateShape.DropDownItems.Add(CreateShapeMenuItem("圆形", RegionShape.Circle, templateShape_Click));
 			this.btnTemplateShape.DropDownItems.Add(CreateShapeMenuItem("菱形", RegionShape.Diamond, templateShape_Click));
 			this.btnMaskShape.Name = "btnMaskShape";
 			this.btnMaskShape.Text = "掩膜形状: 圆形";
@@ -1194,6 +1233,7 @@ namespace Seprays.MarkVision
 			this.canvas.TemplateRoiChanged += new System.EventHandler(canvas_TemplateRoiChanged);
 			this.canvas.TemplateRoiEditCompleted += new System.EventHandler(canvas_TemplateRoiEditCompleted);
 			this.canvas.SearchRoiChanged += new System.EventHandler(canvas_SearchRoiChanged);
+			this.canvas.SearchRoiEditCompleted += new System.EventHandler(canvas_SearchRoiEditCompleted);
 			this.canvas.MaskChanged += new System.EventHandler(canvas_MaskChanged);
 			this.canvas.MaskEditStarted += new System.EventHandler(canvas_MaskEditStarted);
 			this.canvas.ZoomChanged += new System.EventHandler(canvas_ZoomChanged);
@@ -1235,12 +1275,13 @@ namespace Seprays.MarkVision
 			this.grpFeature.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f, System.Drawing.FontStyle.Bold);
 			this.grpFeature.Location = new System.Drawing.Point(0, 0);
 			this.grpFeature.Name = "grpFeature";
-			this.grpFeature.Size = new System.Drawing.Size(316, 348);
+			this.grpFeature.Size = new System.Drawing.Size(316, 412);
 			this.grpFeature.Text = "外轮廓特征";
 			this.grpFeature.Controls.Add(this.lblTemplateMean);
 			this.grpFeature.Controls.Add(this.numTemplateMean);
 			this.grpFeature.Controls.Add(this.lblEdgeSigma);
 			this.grpFeature.Controls.Add(this.numEdgeSigma);
+			this.grpFeature.Controls.Add(this.chkAutoThreshold);
 			this.grpFeature.Controls.Add(this.lblEdgeLow);
 			this.grpFeature.Controls.Add(this.numEdgeLow);
 			this.grpFeature.Controls.Add(this.lblEdgeHigh);
@@ -1279,8 +1320,16 @@ namespace Seprays.MarkVision
 			this.numEdgeSigma.Name = "numEdgeSigma";
 			this.numEdgeSigma.Size = new System.Drawing.Size(154, 26);
 			this.numEdgeSigma.Value = 1.2m;
+			this.chkAutoThreshold.AutoSize = true;
+			this.chkAutoThreshold.Checked = true;
+			this.chkAutoThreshold.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
+			this.chkAutoThreshold.Location = new System.Drawing.Point(16, 95);
+			this.chkAutoThreshold.Name = "chkAutoThreshold";
+			this.chkAutoThreshold.Text = "自动阈值";
+			this.toolTip.SetToolTip(this.chkAutoThreshold, "默认根据图像梯度自动计算高低阈值；手动修改高低阈值后自动切换为手动模式。");
+			this.chkAutoThreshold.CheckedChanged += new System.EventHandler(featureParameter_ValueChanged);
 			this.lblEdgeLow.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.lblEdgeLow.Location = new System.Drawing.Point(14, 96);
+			this.lblEdgeLow.Location = new System.Drawing.Point(14, 124);
 			this.lblEdgeLow.Name = "lblEdgeLow";
 			this.lblEdgeLow.Size = new System.Drawing.Size(120, 26);
 			this.lblEdgeLow.Text = "低阈值";
@@ -1288,14 +1337,14 @@ namespace Seprays.MarkVision
 			this.numEdgeLow.DecimalPlaces = 1;
 			this.numEdgeLow.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.numEdgeLow.Increment = 0.5m;
-			this.numEdgeLow.Location = new System.Drawing.Point(146, 96);
+			this.numEdgeLow.Location = new System.Drawing.Point(146, 124);
 			this.numEdgeLow.Maximum = 254m;
 			this.numEdgeLow.Minimum = 1m;
 			this.numEdgeLow.Name = "numEdgeLow";
 			this.numEdgeLow.Size = new System.Drawing.Size(154, 26);
 			this.numEdgeLow.Value = 15m;
 			this.lblEdgeHigh.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.lblEdgeHigh.Location = new System.Drawing.Point(14, 130);
+			this.lblEdgeHigh.Location = new System.Drawing.Point(14, 158);
 			this.lblEdgeHigh.Name = "lblEdgeHigh";
 			this.lblEdgeHigh.Size = new System.Drawing.Size(120, 26);
 			this.lblEdgeHigh.Text = "高阈值";
@@ -1303,14 +1352,14 @@ namespace Seprays.MarkVision
 			this.numEdgeHigh.DecimalPlaces = 1;
 			this.numEdgeHigh.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.numEdgeHigh.Increment = 0.5m;
-			this.numEdgeHigh.Location = new System.Drawing.Point(146, 130);
+			this.numEdgeHigh.Location = new System.Drawing.Point(146, 158);
 			this.numEdgeHigh.Maximum = 255m;
 			this.numEdgeHigh.Minimum = 2m;
 			this.numEdgeHigh.Name = "numEdgeHigh";
 			this.numEdgeHigh.Size = new System.Drawing.Size(154, 26);
 			this.numEdgeHigh.Value = 35m;
 			this.lblFeatureDistance.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.lblFeatureDistance.Location = new System.Drawing.Point(14, 164);
+			this.lblFeatureDistance.Location = new System.Drawing.Point(14, 192);
 			this.lblFeatureDistance.Name = "lblFeatureDistance";
 			this.lblFeatureDistance.Size = new System.Drawing.Size(120, 26);
 			this.lblFeatureDistance.Text = "点最小间距";
@@ -1318,27 +1367,27 @@ namespace Seprays.MarkVision
 			this.numFeatureDistance.DecimalPlaces = 1;
 			this.numFeatureDistance.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.numFeatureDistance.Increment = 0.5m;
-			this.numFeatureDistance.Location = new System.Drawing.Point(146, 164);
+			this.numFeatureDistance.Location = new System.Drawing.Point(146, 192);
 			this.numFeatureDistance.Maximum = 80m;
 			this.numFeatureDistance.Minimum = 0.5m;
 			this.numFeatureDistance.Name = "numFeatureDistance";
 			this.numFeatureDistance.Size = new System.Drawing.Size(154, 26);
-			this.numFeatureDistance.Value = 6m;
+			this.numFeatureDistance.Value = 2m;
 			this.lblMaxFeaturePoints.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.lblMaxFeaturePoints.Location = new System.Drawing.Point(14, 198);
+			this.lblMaxFeaturePoints.Location = new System.Drawing.Point(14, 226);
 			this.lblMaxFeaturePoints.Name = "lblMaxFeaturePoints";
 			this.lblMaxFeaturePoints.Size = new System.Drawing.Size(120, 26);
 			this.lblMaxFeaturePoints.Text = "最大特征点数";
 			this.lblMaxFeaturePoints.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
 			this.numMaxFeaturePoints.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.numMaxFeaturePoints.Location = new System.Drawing.Point(146, 198);
+			this.numMaxFeaturePoints.Location = new System.Drawing.Point(146, 226);
 			this.numMaxFeaturePoints.Maximum = 50000m;
 			this.numMaxFeaturePoints.Minimum = 100m;
 			this.numMaxFeaturePoints.Name = "numMaxFeaturePoints";
 			this.numMaxFeaturePoints.Size = new System.Drawing.Size(154, 26);
 			this.numMaxFeaturePoints.Value = 12000m;
 			this.lblBrushRadius.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.lblBrushRadius.Location = new System.Drawing.Point(14, 232);
+			this.lblBrushRadius.Location = new System.Drawing.Point(14, 260);
 			this.lblBrushRadius.Name = "lblBrushRadius";
 			this.lblBrushRadius.Size = new System.Drawing.Size(120, 26);
 			this.lblBrushRadius.Text = "掩膜默认半径";
@@ -1346,7 +1395,7 @@ namespace Seprays.MarkVision
 			this.numBrushRadius.DecimalPlaces = 1;
 			this.numBrushRadius.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.numBrushRadius.Increment = 0.5m;
-			this.numBrushRadius.Location = new System.Drawing.Point(146, 232);
+			this.numBrushRadius.Location = new System.Drawing.Point(146, 260);
 			this.numBrushRadius.Maximum = 500m;
 			this.numBrushRadius.Minimum = 1m;
 			this.numBrushRadius.Name = "numBrushRadius";
@@ -1361,23 +1410,23 @@ namespace Seprays.MarkVision
 			this.numBrushRadius.ValueChanged += new System.EventHandler(brushRadius_ValueChanged);
 			this.lblFeatureCount.Font = new System.Drawing.Font("Microsoft YaHei UI", 10f, System.Drawing.FontStyle.Bold);
 			this.lblFeatureCount.ForeColor = System.Drawing.Color.FromArgb(36, 96, 145);
-			this.lblFeatureCount.Location = new System.Drawing.Point(14, 270);
+			this.lblFeatureCount.Location = new System.Drawing.Point(14, 298);
 			this.lblFeatureCount.Size = new System.Drawing.Size(286, 26);
 			this.lblFeatureCount.Text = "特征点：0";
 			this.grpFeature.Controls.Add(this.lblFeatureCount);
-			this.btnExtract.Location = new System.Drawing.Point(14, 302);
+			this.btnExtract.Location = new System.Drawing.Point(14, 330);
 			this.btnExtract.Name = "btnExtract";
 			this.btnExtract.Size = new System.Drawing.Size(137, 32);
 			this.btnExtract.Text = "提取外轮廓点";
 			this.btnExtract.UseVisualStyleBackColor = true;
 			this.btnExtract.Click += new System.EventHandler(btnExtract_Click);
-			this.btnResetFeatures.Location = new System.Drawing.Point(159, 302);
+			this.btnResetFeatures.Location = new System.Drawing.Point(159, 330);
 			this.btnResetFeatures.Name = "btnResetFeatures";
 			this.btnResetFeatures.Size = new System.Drawing.Size(143, 32);
 			this.btnResetFeatures.Text = "清空掩膜并重提取";
 			this.btnResetFeatures.UseVisualStyleBackColor = true;
 			this.btnResetFeatures.Click += new System.EventHandler(btnResetFeatures_Click);
-			this.btnBrushMask.Location = new System.Drawing.Point(14, 340);
+			this.btnBrushMask.Location = new System.Drawing.Point(14, 368);
 			this.btnBrushMask.Name = "btnBrushMask";
 			this.btnBrushMask.Size = new System.Drawing.Size(288, 32);
 			this.btnBrushMask.Text = "画笔掩膜";
@@ -1388,7 +1437,7 @@ namespace Seprays.MarkVision
 			this.grpFeature.Controls.Add(this.btnBrushMask);
 			this.grpModel.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
 			this.grpModel.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f, System.Drawing.FontStyle.Bold);
-			this.grpModel.Location = new System.Drawing.Point(0, 704);
+			this.grpModel.Location = new System.Drawing.Point(0, 420);
 			this.grpModel.Size = new System.Drawing.Size(316, 132);
 			this.grpModel.Text = "模型创建";
 			this.grpModel.Controls.Add(this.lblLevels);
@@ -1431,8 +1480,8 @@ namespace Seprays.MarkVision
 			this.chkUsePolarity.CheckedChanged += new System.EventHandler(modelParameter_ValueChanged);
 			this.grpSearch.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
 			this.grpSearch.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f, System.Drawing.FontStyle.Bold);
-			this.grpSearch.Location = new System.Drawing.Point(0, 356);
-			this.grpSearch.Size = new System.Drawing.Size(316, 340);
+			this.grpSearch.Location = new System.Drawing.Point(0, 560);
+			this.grpSearch.Size = new System.Drawing.Size(316, 306);
 			this.grpSearch.Text = "定位搜索";
 			this.chkSearchRoiEnabled.AutoSize = true;
 			this.chkSearchRoiEnabled.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
@@ -1483,7 +1532,7 @@ namespace Seprays.MarkVision
 			this.numMinScore.Minimum = 0.01m;
 			this.numMinScore.Name = "numMinScore";
 			this.numMinScore.Size = new System.Drawing.Size(154, 26);
-			this.numMinScore.Value = 0.75m;
+			this.numMinScore.Value = 0.70m;
 			this.lblAngleStart.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.lblAngleStart.Location = new System.Drawing.Point(14, 126);
 			this.lblAngleStart.Name = "lblAngleStart";
@@ -1528,7 +1577,7 @@ namespace Seprays.MarkVision
 			this.numScaleMin.Minimum = 0.1m;
 			this.numScaleMin.Name = "numScaleMin";
 			this.numScaleMin.Size = new System.Drawing.Size(154, 26);
-			this.numScaleMin.Value = 0.8m;
+			this.numScaleMin.Value = 0.95m;
 			this.lblScaleMax.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.lblScaleMax.Location = new System.Drawing.Point(14, 228);
 			this.lblScaleMax.Name = "lblScaleMax";
@@ -1543,7 +1592,7 @@ namespace Seprays.MarkVision
 			this.numScaleMax.Minimum = 0.1m;
 			this.numScaleMax.Name = "numScaleMax";
 			this.numScaleMax.Size = new System.Drawing.Size(154, 26);
-			this.numScaleMax.Value = 1.2m;
+			this.numScaleMax.Value = 1.05m;
 			this.lblMaxOverlap.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.lblMaxOverlap.Location = new System.Drawing.Point(14, 262);
 			this.lblMaxOverlap.Name = "lblMaxOverlap";
@@ -1558,7 +1607,7 @@ namespace Seprays.MarkVision
 			this.numMaxOverlap.Name = "numMaxOverlap";
 			this.numMaxOverlap.Size = new System.Drawing.Size(154, 26);
 			this.lblGreediness.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
-			this.lblGreediness.Location = new System.Drawing.Point(14, 296);
+			this.lblGreediness.Location = new System.Drawing.Point(14, 262);
 			this.lblGreediness.Name = "lblGreediness";
 			this.lblGreediness.Size = new System.Drawing.Size(120, 26);
 			this.lblGreediness.Text = "贪婪度";
@@ -1566,11 +1615,11 @@ namespace Seprays.MarkVision
 			this.numGreediness.DecimalPlaces = 2;
 			this.numGreediness.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f);
 			this.numGreediness.Increment = 0.05m;
-			this.numGreediness.Location = new System.Drawing.Point(146, 296);
+			this.numGreediness.Location = new System.Drawing.Point(146, 262);
 			this.numGreediness.Maximum = 1m;
 			this.numGreediness.Name = "numGreediness";
 			this.numGreediness.Size = new System.Drawing.Size(154, 26);
-			this.numGreediness.Value = 0.7m;
+			this.numGreediness.Value = 0.5m;
 			this.numSearchMean.ValueChanged += new System.EventHandler(runtimeParameter_ValueChanged);
 			this.numMinScore.ValueChanged += new System.EventHandler(runtimeParameter_ValueChanged);
 			this.numAngleStart.ValueChanged += new System.EventHandler(modelParameter_ValueChanged);
@@ -1583,20 +1632,14 @@ namespace Seprays.MarkVision
 			this.lblMaxOverlap.Visible = false;
 			this.numMaxOverlap.Visible = false;
 			this.grpCircle.Visible = false;
-			this.grpFeature.Size = new System.Drawing.Size(316, 384);
-			this.grpModel.Location = new System.Drawing.Point(0, 392);
-			this.grpSearch.Location = new System.Drawing.Point(0, 532);
-			this.grpSearch.Size = new System.Drawing.Size(316, 306);
-			this.lblGreediness.Location = new System.Drawing.Point(14, 262);
-			this.numGreediness.Location = new System.Drawing.Point(146, 262);
-			this.toolTip.SetToolTip(this.numEdgeLow, "Canny 弱边缘连接阈值；必须小于高阈值。修改后重新提取并创建模板。");
+			this.toolTip.SetToolTip(this.numEdgeLow, "Canny 弱边缘连接阈值；必须小于高阈值。修改后自动切换为手动阈值并重新提取。");
 			this.toolTip.SetToolTip(this.numEdgeHigh, "Canny 强边缘阈值；升高可减少弱纹理和噪声。");
 			this.toolTip.SetToolTip(this.numLevels, "0 自动选择金字塔层数；手动增大可加速，但小目标可能丢失。");
 			this.toolTip.SetToolTip(this.numMinContrast, "搜索图中有效梯度的最小对比度，范围 1–255。");
-			this.toolTip.SetToolTip(this.numGreediness, "范围 0–1；越大越快，复杂场景可能漏检。修改无需重建模板。");
+			this.toolTip.SetToolTip(this.numGreediness, "范围 0–1；越大越快，较低值稳定性更高。修改无需重建模板。");
 			this.grpCircle.Anchor = System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left | System.Windows.Forms.AnchorStyles.Right;
 			this.grpCircle.Font = new System.Drawing.Font("Microsoft YaHei UI", 9f, System.Drawing.FontStyle.Bold);
-			this.grpCircle.Location = new System.Drawing.Point(0, 844);
+			this.grpCircle.Location = new System.Drawing.Point(0, 872);
 			this.grpCircle.Size = new System.Drawing.Size(316, 126);
 			this.grpCircle.Text = "圆形 Mark 精修（可选）";
 			this.chkCircleRefinement.AutoSize = true;
@@ -1681,6 +1724,7 @@ namespace Seprays.MarkVision
 			this.grpModel.ResumeLayout(false);
 			this.grpModel.PerformLayout();
 			this.grpFeature.ResumeLayout(false);
+			this.grpFeature.PerformLayout();
 			this.panelActions.ResumeLayout(false);
 			((System.ComponentModel.ISupportInitialize)this.numTemplateMean).EndInit();
 			((System.ComponentModel.ISupportInitialize)this.numEdgeSigma).EndInit();

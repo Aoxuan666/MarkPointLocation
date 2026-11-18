@@ -9,21 +9,20 @@ namespace Seprays.MarkVision
 	[Serializable]
 	public sealed class MarkLocateJob
 	{
-		public int Version { get; set; } = 3;
+		public int Version { get; set; } = 4;
 
 		public RectangleF TemplateRoi { get; set; }
 
 		/// <summary>
-		/// Shape of the template ROI. The page starts new ROIs as circles.
+		/// Shape of the template ROI. The page starts new ROIs as rectangles.
 		/// </summary>
 		[field: OptionalField(VersionAdded = 3)]
-
-		public RegionShape TemplateRoiShape { get; set; } = RegionShape.Circle;
+		public RegionShape TemplateRoiShape { get; set; } = RegionShape.Rectangle;
 
 		public RectangleF SearchRoi { get; set; }
 
 		[field: OptionalField(VersionAdded = 2)]
-			public bool SearchRoiEnabled { get; set; }
+		public bool SearchRoiEnabled { get; set; }
 
 		/// <summary>
 		/// Set by the host application. The setup page never changes this flag.
@@ -68,7 +67,7 @@ namespace Seprays.MarkVision
 				Parameters.EdgeSigma = 1.2;
 				Parameters.EdgeLowThreshold = 15.0;
 				Parameters.EdgeHighThreshold = 35.0;
-				Parameters.FeatureMinDistancePx = 6.0;
+				Parameters.FeatureMinDistancePx = 2.0;
 				Parameters.MaxFeaturePoints = 12000;
 				SearchRoiEnabled = !SearchRoi.IsEmpty;
 				Version = 2;
@@ -79,9 +78,15 @@ namespace Seprays.MarkVision
 				EnableCircleDetection = Parameters != null && Parameters.EnableCircleRefinement;
 				Version = 3;
 			}
+			if (Version < 4)
+			{
+				// Preserve explicit manual thresholds saved by pre-v4 recipes.
+				Parameters.AutoEdgeThreshold = false;
+				Version = 4;
+			}
 			if (!Enum.IsDefined(typeof(RegionShape), TemplateRoiShape))
 			{
-				TemplateRoiShape = RegionShape.Circle;
+				TemplateRoiShape = RegionShape.Rectangle;
 			}
 			Parameters.Normalize();
 			MaskStrokes = MaskStrokes ?? new List<MaskStroke>();
@@ -118,16 +123,6 @@ namespace Seprays.MarkVision
 				return clipped;
 			}
 			return RectangleF.Empty;
-		}
-
-		private static RectangleF ExpandRoi(RectangleF roi, float margin, RectangleF bounds)
-		{
-			if (roi.IsEmpty)
-			{
-				return bounds;
-			}
-			RectangleF expanded = RectangleF.FromLTRB(roi.Left - margin, roi.Top - margin, roi.Right + margin, roi.Bottom + margin);
-			return RectangleF.Intersect(expanded, bounds);
 		}
 	}
 }

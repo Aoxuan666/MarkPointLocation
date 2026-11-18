@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Linq;
@@ -12,84 +13,47 @@ namespace Seprays.MarkVision
 	{
 		private sealed class HalconImageLease : IDisposable
 		{
-			private GCHandle _grayHandle;
+			public HObject Image { get; }
 
-			public HImage Image { get; }
-
-			private HalconImageLease(HImage image, GCHandle grayHandle)
+			private HalconImageLease(HObject image)
 			{
 				Image = image;
-				_grayHandle = grayHandle;
 			}
 
 			public static HalconImageLease FromBitmap(Bitmap source)
 			{
-				int width = source.Width;
-				int height = source.Height;
-				byte[] gray = new byte[width * height];
-				using (Bitmap converted = new Bitmap(width, height, PixelFormat.Format24bppRgb))
-				{
-					using (Graphics graphics = Graphics.FromImage(converted))
-					{
-						graphics.DrawImageUnscaled(source, 0, 0);
-					}
-					BitmapData data = converted.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
-					try
-					{
-						int stride = Math.Abs(data.Stride);
-						byte[] rgb = new byte[stride * height];
-						Marshal.Copy(data.Scan0, rgb, 0, rgb.Length);
-						for (int y = 0; y < height; y++)
-						{
-							int sourceRow = ((data.Stride < 0) ? ((height - 1 - y) * stride) : (y * stride));
-							int targetRow = y * width;
-							for (int x = 0; x < width; x++)
-							{
-								int offset = sourceRow + x * 3;
-								gray[targetRow + x] = (byte)(0.114 * (double)(int)rgb[offset] + 0.587 * (double)(int)rgb[offset + 1] + 0.299 * (double)(int)rgb[offset + 2]);
-							}
-						}
-					}
-					finally
-					{
-						converted.UnlockBits(data);
-					}
-				}
-				GCHandle handle = GCHandle.Alloc(gray, GCHandleType.Pinned);
-				HImage image = new HImage();
-				try
-				{
-					image.GenImage1("byte", width, height, handle.AddrOfPinnedObject());
-					return new HalconImageLease(image, handle);
-				}
-				catch
-				{
-					image.Dispose();
-					handle.Free();
-					throw;
-				}
+				HObject gray = ConvertBitmapToHalconGray(source);
+				return new HalconImageLease(gray);
+			}
+
+			public static HalconImageLease FromBitmapRegion(Bitmap source, Rectangle region)
+			{
+				HObject gray = ConvertBitmapRegionToHalconGray(source, region);
+				return new HalconImageLease(gray);
 			}
 
 			public void Dispose()
 			{
 				Image?.Dispose();
-				if (_grayHandle.IsAllocated)
-				{
-					_grayHandle.Free();
-				}
 			}
 		}
 
 		public MarkTeachData Teach(Bitmap source, MarkLocateJob inputJob)
 		{
+			return TeachCore(source, inputJob, "SDK建模");
+		}
+
+		internal MarkTeachData TeachCore(Bitmap source, MarkLocateJob inputJob, string callerSource)
+		{
 			if (source == null)
 			{
-				throw new ArgumentNullException("source");
+				throw new ArgumentNullException(nameof(source));
 			}
 			if (inputJob == null)
 			{
-				throw new ArgumentNullException("inputJob");
+				throw new ArgumentNullException(nameof(inputJob));
 			}
+			Stopwatch timer = Stopwatch.StartNew();
 			MarkLocateJob job = inputJob.DeepClone();
 			job.Normalize(source.Size);
 			Rectangle templateRect = ToPixelRectangle(job.TemplateRoi, source.Size);
@@ -97,10 +61,20 @@ namespace Seprays.MarkVision
 			{
 				throw new InvalidOperationException("模板区域过小，请重新拖拽模板框。");
 			}
-			List<PointF> featurePoints = ((job.TeachData?.FeaturePoints == null) ? new List<PointF>() : new List<PointF>(job.TeachData.FeaturePoints));
+			List<PointF> featurePoints = job.TeachData?.FeaturePoints == null
+				? new List<PointF>()
+				: new List<PointF>(job.TeachData.FeaturePoints);
 			if (CountRealPoints(featurePoints) < 12)
 			{
-				featurePoints = FilterFeaturePointsInRoi(ExtractFeaturePoints(source, job), job.MaskStrokes, job.TemplateRoi, job.TemplateRoiShape);
+				double appliedLow;
+				double appliedHigh;
+				List<PointF> extracted = ExtractFeaturePointsCore(source, job, out appliedLow, out appliedHigh);
+				if (job.Parameters.AutoEdgeThreshold)
+				{
+					job.Parameters.EdgeLowThreshold = appliedLow;
+					job.Parameters.EdgeHighThreshold = appliedHigh;
+				}
+				featurePoints = FilterFeaturePointsInRoi(extracted, job.MaskStrokes, job.TemplateRoi, job.TemplateRoiShape);
 			}
 			featurePoints = FilterFeaturePointsInRoi(featurePoints, job.MaskStrokes, job.TemplateRoi, job.TemplateRoiShape);
 			if (CountRealPoints(featurePoints) < 12)
@@ -112,29 +86,48 @@ namespace Seprays.MarkVision
 			try
 			{
 				GenContoursFromFeaturePoints(featurePoints, out contoursXld);
-				HTuple numLevels = ((job.Parameters.NumLevels <= 0) ? new HTuple("auto") : new HTuple(job.Parameters.NumLevels));
-				HOperatorSet.CreateScaledShapeModelXld(contoursXld, numLevels, DegreesToRadians(job.Parameters.AngleStartDegrees), DegreesToRadians(job.Parameters.AngleExtentDegrees), "auto", job.Parameters.ScaleMin, job.Parameters.ScaleMax, "auto", "auto", "ignore_local_polarity", job.Parameters.MinContrast, out modelId);
+				GetXldBoundingCenter(contoursXld, out double defaultRow, out double defaultColumn);
+				HTuple numLevels = job.Parameters.NumLevels <= 0 ? new HTuple("auto") : new HTuple(job.Parameters.NumLevels);
+				HOperatorSet.CreateScaledShapeModelXld(
+					contoursXld,
+					numLevels,
+					DegreesToRadians(job.Parameters.AngleStartDegrees),
+					DegreesToRadians(job.Parameters.AngleExtentDegrees),
+					"auto",
+					job.Parameters.ScaleMin,
+					job.Parameters.ScaleMax,
+					"auto",
+					"auto",
+					"ignore_local_polarity",
+					job.Parameters.MinContrast,
+					out modelId);
 				if (!job.Parameters.UsePolarity)
 				{
-					// Polygon XLDs have no edge_direction attribute. Recover polarity
-					// from the template image at the model's unmodified default origin.
-					var points = featurePoints.Where(point => !IsContourSeparator(point)).ToList();
-					double row = (points.Min(point => point.Y) + points.Max(point => point.Y)) * 0.5;
-					double column = (points.Min(point => point.X) + points.Max(point => point.X)) * 0.5;
-					using (var image = HalconImageLease.FromBitmap(source))
+					// Recover edge polarity from the same MeanImage-filtered template used for extraction.
+					using (HalconImageLease image = HalconImageLease.FromBitmap(source))
 					{
-						HOperatorSet.VectorAngleToRigid(0, 0, 0, row, column, 0, out var transform);
-						using (transform)
-							HOperatorSet.SetShapeModelMetric(image.Image, modelId, transform, "ignore_global_polarity");
+						HObject filtered = null;
+						HTuple transform = null;
+						try
+						{
+							HObject metricImage = ApplyMeanFilter(image.Image, job.Parameters.TemplateMeanSize, out filtered);
+							HOperatorSet.VectorAngleToRigid(0, 0, 0, defaultRow, defaultColumn, 0, out transform);
+							HOperatorSet.SetShapeModelMetric(metricImage, modelId, transform, "ignore_global_polarity");
+						}
+						finally
+						{
+							transform?.Dispose();
+							filtered?.Dispose();
+						}
 					}
 				}
-				SetModelOriginToTemplateCenter(modelId, featurePoints, job.TemplateRoi);
+				SetModelOriginToTemplateCenter(modelId, defaultRow, defaultColumn, job.TemplateRoi);
 				List<List<PointF>> contours = ReadModelContours(modelId);
-				if (contours.Sum((List<PointF> contour) => contour.Count) < 12)
+				if (contours.Sum(contour => contour.Count) < 12)
 				{
 					throw new InvalidOperationException("擦除后可用模型点不足，请减小擦除范围或调整边缘参数。");
 				}
-				return new MarkTeachData
+				MarkTeachData teachData = new MarkTeachData
 				{
 					HasModel = true,
 					ModelBytes = ExportShapeModel(modelId),
@@ -143,6 +136,15 @@ namespace Seprays.MarkVision
 					TemplateSize = templateRect.Size,
 					CreatedAt = DateTime.Now
 				};
+				timer.Stop();
+				MarkInspectionLogger.LogTeach(callerSource, source, job, CountRealPoints(featurePoints), true, timer.Elapsed.TotalMilliseconds, "模型创建成功");
+				return teachData;
+			}
+			catch (Exception ex)
+			{
+				timer.Stop();
+				MarkInspectionLogger.LogTeach(callerSource, source, job, CountRealPoints(featurePoints), false, timer.Elapsed.TotalMilliseconds, ex.Message);
+				throw;
 			}
 			finally
 			{
@@ -153,13 +155,20 @@ namespace Seprays.MarkVision
 
 		public List<PointF> ExtractFeaturePoints(Bitmap source, MarkLocateJob inputJob)
 		{
+			double unusedLow;
+			double unusedHigh;
+			return ExtractFeaturePointsCore(source, inputJob, out unusedLow, out unusedHigh);
+		}
+
+		internal List<PointF> ExtractFeaturePointsCore(Bitmap source, MarkLocateJob inputJob, out double appliedLow, out double appliedHigh)
+		{
 			if (source == null)
 			{
-				throw new ArgumentNullException("source");
+				throw new ArgumentNullException(nameof(source));
 			}
 			if (inputJob == null)
 			{
-				throw new ArgumentNullException("inputJob");
+				throw new ArgumentNullException(nameof(inputJob));
 			}
 			MarkLocateJob job = inputJob.DeepClone();
 			job.Normalize(source.Size);
@@ -168,7 +177,22 @@ namespace Seprays.MarkVision
 			{
 				throw new InvalidOperationException("模板区域过小，请重新拖拽模板框。");
 			}
-			using (HalconImageLease image = HalconImageLease.FromBitmap(source))
+			appliedLow = job.Parameters.EdgeLowThreshold;
+			appliedHigh = job.Parameters.EdgeHighThreshold;
+			int filterMargin = Math.Max(8, (job.Parameters.TemplateMeanSize / 2) + (int)Math.Ceiling(job.Parameters.EdgeSigma * 4.0) + 4);
+			Rectangle cropRect = Rectangle.Intersect(
+				Rectangle.FromLTRB(
+					templateRect.Left - filterMargin,
+					templateRect.Top - filterMargin,
+					templateRect.Right + filterMargin,
+					templateRect.Bottom + filterMargin),
+				new Rectangle(0, 0, source.Width, source.Height));
+			RectangleF localRoi = new RectangleF(
+				job.TemplateRoi.X - cropRect.Left,
+				job.TemplateRoi.Y - cropRect.Top,
+				job.TemplateRoi.Width,
+				job.TemplateRoi.Height);
+			using (HalconImageLease image = HalconImageLease.FromBitmapRegion(source, cropRect))
 			{
 				HObject filtered = null;
 				HObject templateRegion = null;
@@ -177,14 +201,50 @@ namespace Seprays.MarkVision
 				HObject selectedEdges = null;
 				try
 				{
-					HOperatorSet.MeanImage(image.Image, out filtered, job.Parameters.TemplateMeanSize, job.Parameters.TemplateMeanSize);
-					CreateTemplateRegion(job.TemplateRoi, job.TemplateRoiShape, out templateRegion);
-					HOperatorSet.ReduceDomain(filtered, templateRegion, out reduced);
-					HOperatorSet.EdgesSubPix(reduced, out edges, "canny", job.Parameters.EdgeSigma, job.Parameters.EdgeLowThreshold, job.Parameters.EdgeHighThreshold);
-					HOperatorSet.SelectShapeXld(edges, out selectedEdges, "contlength", "and", Math.Max(6.0, job.Parameters.FeatureMinDistancePx * 1.5), 999999.0);
-					return ReadFeaturePoints(selectedEdges, job.Parameters.FeatureMinDistancePx, job.Parameters.MaxFeaturePoints)
-						.Where(point => RegionShapeGeometry.Contains(point, job.TemplateRoi, job.TemplateRoiShape) || IsContourSeparator(point))
-						.ToList();
+					HObject sourceGray = ApplyMeanFilter(image.Image, job.Parameters.TemplateMeanSize, out filtered);
+					CreateTemplateRegion(localRoi, job.TemplateRoiShape, out templateRegion);
+					HOperatorSet.ReduceDomain(sourceGray, templateRegion, out reduced);
+					double maxGrad = 0.0;
+					if (job.Parameters.AutoEdgeThreshold)
+					{
+						EstimateAutoEdgeThresholds(reduced, templateRegion, job.Parameters.EdgeSigma, out appliedLow, out appliedHigh, out maxGrad);
+						job.Parameters.EdgeLowThreshold = appliedLow;
+						job.Parameters.EdgeHighThreshold = appliedHigh;
+					}
+					double minLength = Math.Max(4.0, Math.Min(9.0, job.Parameters.FeatureMinDistancePx * 1.5));
+					HOperatorSet.EdgesSubPix(reduced, out edges, "canny", job.Parameters.EdgeSigma, appliedLow, appliedHigh);
+					HOperatorSet.SelectShapeXld(edges, out selectedEdges, "contlength", "and", minLength, 999999.0);
+					if (job.Parameters.AutoEdgeThreshold && maxGrad >= 2.0 && CountHalconObjects(selectedEdges) == 0)
+					{
+						// Fallback pass with relaxed hysteresis thresholds when automatic thresholds are conservative.
+						double relaxedHigh = Math.Round(Math.Max(2.0, appliedHigh * 0.6), 1);
+						double relaxedLow = Math.Round(Math.Max(1.0, Math.Min(relaxedHigh - 1.0, appliedLow * 0.5)), 1);
+						edges?.Dispose();
+						selectedEdges?.Dispose();
+						edges = null;
+						selectedEdges = null;
+						HOperatorSet.EdgesSubPix(reduced, out edges, "canny", job.Parameters.EdgeSigma, relaxedLow, relaxedHigh);
+						HOperatorSet.SelectShapeXld(edges, out selectedEdges, "contlength", "and", minLength, 999999.0);
+						if (CountHalconObjects(selectedEdges) > 0)
+						{
+							appliedLow = relaxedLow;
+							appliedHigh = relaxedHigh;
+							job.Parameters.EdgeLowThreshold = appliedLow;
+							job.Parameters.EdgeHighThreshold = appliedHigh;
+						}
+					}
+					List<PointF> points = ReadFeaturePoints(selectedEdges, job.Parameters.FeatureMinDistancePx, job.Parameters.MaxFeaturePoints);
+					if (cropRect.Left != 0 || cropRect.Top != 0)
+					{
+						for (int i = 0; i < points.Count; i++)
+						{
+							if (!IsContourSeparator(points[i]))
+							{
+								points[i] = new PointF(points[i].X + cropRect.Left, points[i].Y + cropRect.Top);
+							}
+						}
+					}
+					return FilterFeaturePointsInRoi(points, null, job.TemplateRoi, job.TemplateRoiShape);
 				}
 				finally
 				{
@@ -204,7 +264,9 @@ namespace Seprays.MarkVision
 
 		internal static List<PointF> FilterFeaturePointsInRoi(IEnumerable<PointF> source, IEnumerable<MaskStroke> strokes, RectangleF templateRoi, RegionShape templateShape)
 		{
-			List<MaskStroke> maskStrokes = ((strokes == null) ? new List<MaskStroke>() : strokes.Where((MaskStroke maskStroke) => maskStroke != null && !maskStroke.GetBounds().IsEmpty).ToList());
+			List<MaskStroke> maskStrokes = strokes == null
+				? new List<MaskStroke>()
+				: strokes.Where(maskStroke => maskStroke != null && !maskStroke.GetBounds().IsEmpty).ToList();
 			List<PointF> result = new List<PointF>();
 			bool segmentHasPoint = false;
 			foreach (PointF point in source ?? Enumerable.Empty<PointF>())
@@ -247,6 +309,10 @@ namespace Seprays.MarkVision
 			{
 				return MarkLocateResult.Failed("待检测图片为空。");
 			}
+			if (source.Width < 8 || source.Height < 8)
+			{
+				return MarkLocateResult.Failed("待检测图片尺寸过小。");
+			}
 			if (inputJob == null)
 			{
 				return MarkLocateResult.Failed("Mark 定位参数为空。");
@@ -270,18 +336,81 @@ namespace Seprays.MarkVision
 				HTuple modelId = null;
 				try
 				{
-					int meanSize = job.Parameters.SearchMeanSize;
-					HOperatorSet.MeanImage(image.Image, out filtered, meanSize, meanSize);
-					HObject imageToSearch = filtered;
+					HOperatorSet.SetSystem("border_shape_models", "true");
+					HObject grayWork = ApplyMeanFilter(image.Image, job.Parameters.SearchMeanSize, out filtered);
+					HObject imageToSearch = grayWork;
 					if (job.SearchRoiEnabled && !job.SearchRoi.IsEmpty)
 					{
 						Rectangle searchRect = ToPixelRectangle(job.SearchRoi, source.Size);
 						HOperatorSet.GenRectangle1(out searchRegion, searchRect.Top, searchRect.Left, searchRect.Bottom - 1, searchRect.Right - 1);
-						HOperatorSet.ReduceDomain(filtered, searchRegion, out searchImage);
+						HOperatorSet.ReduceDomain(grayWork, searchRegion, out searchImage);
 						imageToSearch = searchImage;
 					}
 					modelId = ImportShapeModel(job.TeachData.ModelBytes);
-					HOperatorSet.FindScaledShapeModel(imageToSearch, modelId, DegreesToRadians(job.Parameters.AngleStartDegrees), DegreesToRadians(job.Parameters.AngleExtentDegrees), job.Parameters.ScaleMin, job.Parameters.ScaleMax, job.Parameters.MinScore, 1, job.Parameters.MaxOverlap, "least_squares", 0, job.Parameters.Greediness, out var rows, out var columns, out var angles, out var scales, out var scores);
+					double angleStart = DegreesToRadians(job.Parameters.AngleStartDegrees);
+					double angleExtent = DegreesToRadians(job.Parameters.AngleExtentDegrees);
+					HTuple rows;
+					HTuple columns;
+					HTuple angles;
+					HTuple scales;
+					HTuple scores;
+					HOperatorSet.FindScaledShapeModel(
+						imageToSearch,
+						modelId,
+						angleStart,
+						angleExtent,
+						job.Parameters.ScaleMin,
+						job.Parameters.ScaleMax,
+						job.Parameters.MinScore,
+						1,
+						job.Parameters.MaxOverlap,
+						"least_squares_high",
+						0,
+						job.Parameters.Greediness,
+						out rows,
+						out columns,
+						out angles,
+						out scales,
+						out scores);
+					if (scores == null || scores.Length == 0)
+					{
+						// Retry once with lower pyramid pruning and relaxed min_contrast while keeping MinScore strict.
+						int fallbackContrast = Math.Max(2, Math.Min(6, job.Parameters.MinContrast / 2));
+						double fallbackGreediness = Math.Min(job.Parameters.Greediness, 0.25);
+						if (fallbackContrast < job.Parameters.MinContrast || fallbackGreediness < job.Parameters.Greediness)
+						{
+							try
+							{
+								HOperatorSet.SetShapeModelParam(modelId, "min_contrast", fallbackContrast);
+							}
+							catch
+							{
+							}
+							rows?.Dispose();
+							columns?.Dispose();
+							angles?.Dispose();
+							scales?.Dispose();
+							scores?.Dispose();
+							HOperatorSet.FindScaledShapeModel(
+								imageToSearch,
+								modelId,
+								angleStart,
+								angleExtent,
+								job.Parameters.ScaleMin,
+								job.Parameters.ScaleMax,
+								job.Parameters.MinScore,
+								1,
+								job.Parameters.MaxOverlap,
+								"least_squares_high",
+								0,
+								fallbackGreediness,
+								out rows,
+								out columns,
+								out angles,
+								out scales,
+								out scores);
+						}
+					}
 					if (scores == null || scores.Length == 0)
 					{
 						return MarkLocateResult.Failed("未找到满足分数要求的 Mark。");
@@ -290,18 +419,24 @@ namespace Seprays.MarkVision
 					double col = columns[0].D;
 					double angle = angles[0].D;
 					double scale = scales[0].D;
+					double score = scores[0].D;
+					rows?.Dispose();
+					columns?.Dispose();
+					angles?.Dispose();
+					scales?.Dispose();
+					scores?.Dispose();
 					MarkLocateResult result = new MarkLocateResult
 					{
 						Success = true,
-						Message = $"定位成功，分数 {scores[0].D:F3}。",
+						Message = $"定位成功，分数 {score:F3}。",
 						ModelPoint = new PointF((float)col, (float)row),
-						Score = scores[0].D,
+						Score = score,
 						AngleRadians = angle,
 						Scale = scale,
-						MatchedContours = TransformContours(job.TeachData.ModelContours, row, col, angle, scale)
+						MatchedContours = TransformContoursWithHalcon(job.TeachData.ModelContours, row, col, angle, scale)
 					};
 					job.Parameters.EnableCircleRefinement = circleEnabled;
-					ApplyCircleRefinement(source, job.TemplateRoi, job.Parameters, result);
+					ApplyCircleRefinement(grayWork, source.Size, job.TemplateRoi, job.Parameters, result);
 					return result;
 				}
 				catch (Exception ex)
@@ -327,7 +462,8 @@ namespace Seprays.MarkVision
 			}
 			PointF initialCenter = new PointF(roi.Left + roi.Width * 0.5f, roi.Top + roi.Height * 0.5f);
 			double expectedRadius = job.Parameters.ExpectedCircleRadius;
-			if (expectedRadius <= 1.0)
+			bool hasExplicitRadius = expectedRadius > 1.0;
+			if (!hasExplicitRadius)
 			{
 				expectedRadius = Math.Min(roi.Width, roi.Height) * 0.5;
 			}
@@ -339,17 +475,274 @@ namespace Seprays.MarkVision
 				Score = 0.0,
 				Scale = 1.0
 			};
-			if (TryRefineCircle(source, initialCenter, expectedRadius, job.Parameters, out var center, out var radius))
+			using (HalconImageLease image = HalconImageLease.FromBitmap(source))
 			{
-				result.Success = true;
-				result.Message = "找圆成功。";
-				result.ModelPoint = center;
-				result.CircleFound = true;
-				result.CirclePoint = center;
-				result.CircleRadius = radius;
-				result.Score = 1.0;
+				HObject filtered = null;
+				try
+				{
+					HObject grayWork = ApplyMeanFilter(image.Image, job.Parameters.SearchMeanSize, out filtered);
+					PointF center;
+					float radius;
+					if (TryRefineCircleHalcon(grayWork, source.Size, initialCenter, expectedRadius, job.Parameters, out center, out radius) ||
+						(!hasExplicitRadius && TryDetectCircleByEdgesHalcon(grayWork, roi, source.Size, job.Parameters, out center, out radius)))
+					{
+						result.Success = true;
+						result.Message = $"找圆成功，半径 {radius:F2}px。";
+						result.ModelPoint = center;
+						result.CircleFound = true;
+						result.CirclePoint = center;
+						result.CircleRadius = radius;
+						result.Score = 1.0;
+						result.MatchedContours = CreateCircleContourPoints(center, radius);
+					}
+					return result;
+				}
+				catch (Exception ex)
+				{
+					return MarkLocateResult.Failed(ex.GetType().Name + ": " + ex.Message);
+				}
+				finally
+				{
+					filtered?.Dispose();
+				}
 			}
-			return result;
+		}
+
+		internal static Bitmap RenderResultImageWithHalcon(Bitmap source, MarkLocateResult result)
+		{
+			if (source == null)
+			{
+				return null;
+			}
+			int width = source.Width;
+			int height = source.Height;
+			HObject rgb = null;
+			HObject current = null;
+			HObject contourXld = null;
+			HObject crossXld = null;
+			HObject circleXld = null;
+			HObject circleCrossXld = null;
+			HObject interleaved = null;
+			try
+			{
+				rgb = ConvertBitmapToHalconRgb(source);
+				current = rgb;
+				rgb = null;
+				bool hasContours = false;
+				if (result != null && result.MatchedContours != null && result.MatchedContours.Count > 0)
+				{
+					List<PointF> flatContours = new List<PointF>();
+					foreach (List<PointF> contour in result.MatchedContours)
+					{
+						if (contour == null) continue;
+						bool added = false;
+						foreach (PointF point in contour)
+						{
+							if (!IsFinite(point))
+							{
+								if (added)
+								{
+									flatContours.Add(CreateContourSeparator());
+									added = false;
+								}
+								continue;
+							}
+							flatContours.Add(point);
+							added = true;
+							hasContours = true;
+						}
+						if (added)
+						{
+							flatContours.Add(CreateContourSeparator());
+						}
+					}
+					TrimSeparators(flatContours);
+					if (CountRealPoints(flatContours) >= 2)
+					{
+						GenContoursFromFeaturePoints(flatContours, out contourXld);
+						PaintXldStep(ref current, contourXld, 0, 191, 255);
+					}
+				}
+				if (result != null && (result.Success || hasContours) && IsFinite(result.ModelPoint))
+				{
+					BuildCrossXld(result.ModelPoint, 10.0, out crossXld);
+					PaintXldStep(ref current, crossXld, 50, 205, 50);
+				}
+				if (result != null && result.CircleFound && IsFinite(result.CirclePoint) &&
+					result.CircleRadius > 0f && !float.IsInfinity(result.CircleRadius))
+				{
+					HOperatorSet.GenCircleContourXld(
+						out circleXld,
+						(double)result.CirclePoint.Y,
+						(double)result.CirclePoint.X,
+						(double)result.CircleRadius,
+						0.0,
+						Math.PI * 2.0,
+						"positive",
+						1.0);
+					PaintXldStep(ref current, circleXld, 255, 165, 0);
+					BuildCrossXld(result.CirclePoint, 10.0, out circleCrossXld);
+					PaintXldStep(ref current, circleCrossXld, 255, 165, 0);
+				}
+
+				Bitmap output = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+				try
+				{
+					BitmapData outData = output.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+					try
+					{
+						int outStride = Math.Abs(outData.Stride);
+						HOperatorSet.InterleaveChannels(current, out interleaved, "rgb", outStride, 0);
+						HTuple pointer;
+						HTuple type;
+						HTuple iw;
+						HTuple ih;
+						HOperatorSet.GetImagePointer1(interleaved, out pointer, out type, out iw, out ih);
+						IntPtr srcPtr = (IntPtr)pointer[0].L;
+						if (outData.Stride > 0)
+						{
+							byte[] buffer = new byte[outStride * height];
+							Marshal.Copy(srcPtr, buffer, 0, buffer.Length);
+							Marshal.Copy(buffer, 0, outData.Scan0, buffer.Length);
+						}
+						else
+						{
+							byte[] rowBuffer = new byte[outStride];
+							for (int y = 0; y < height; y++)
+							{
+								Marshal.Copy(IntPtr.Add(srcPtr, y * outStride), rowBuffer, 0, outStride);
+								Marshal.Copy(rowBuffer, 0, IntPtr.Add(outData.Scan0, (height - 1 - y) * outStride), outStride);
+							}
+						}
+					}
+					finally
+					{
+						output.UnlockBits(outData);
+					}
+					return output;
+				}
+				catch
+				{
+					output.Dispose();
+					throw;
+				}
+			}
+			finally
+			{
+				interleaved?.Dispose();
+				circleCrossXld?.Dispose();
+				circleXld?.Dispose();
+				crossXld?.Dispose();
+				contourXld?.Dispose();
+				current?.Dispose();
+				rgb?.Dispose();
+			}
+		}
+
+		private static HObject ApplyMeanFilter(HObject grayImage, int meanSize, out HObject ownedFiltered)
+		{
+			if (meanSize <= 1)
+			{
+				ownedFiltered = null;
+				return grayImage;
+			}
+			HOperatorSet.MeanImage(grayImage, out ownedFiltered, meanSize, meanSize);
+			return ownedFiltered;
+		}
+
+		private static void EstimateAutoEdgeThresholds(HObject reduced, HObject templateRegion, double sigma, out double lowThreshold, out double highThreshold, out double maxGradient)
+		{
+			HObject grad = null;
+			HObject gradByte = null;
+			HObject edgeMask = null;
+			HObject smoothMask = null;
+			HObject nonEdgeMask = null;
+			try
+			{
+				HOperatorSet.DerivateGauss(reduced, out grad, sigma, "gradient");
+				HOperatorSet.ConvertImageType(grad, out gradByte, "byte");
+				HTuple minG;
+				HTuple maxG;
+				HTuple rangeG;
+				HOperatorSet.MinMaxGray(templateRegion, grad, 0, out minG, out maxG, out rangeG);
+				maxGradient = (maxG != null && maxG.Length > 0) ? maxG[0].D : 0.0;
+				minG?.Dispose();
+				maxG?.Dispose();
+				rangeG?.Dispose();
+				if (maxGradient < 2.0)
+				{
+					lowThreshold = 5.0;
+					highThreshold = 15.0;
+					return;
+				}
+				HTuple tMaxSepTuple;
+				HOperatorSet.BinaryThreshold(gradByte, out edgeMask, "max_separability", "light", out tMaxSepTuple);
+				double tMaxSep = (tMaxSepTuple != null && tMaxSepTuple.Length > 0) ? tMaxSepTuple[0].D : 15.0;
+				tMaxSepTuple?.Dispose();
+
+				double tSmooth = 0.0;
+				try
+				{
+					HTuple tSmoothTuple;
+					HOperatorSet.BinaryThreshold(gradByte, out smoothMask, "smooth_histo", "light", out tSmoothTuple);
+					if (tSmoothTuple != null && tSmoothTuple.Length > 0)
+					{
+						tSmooth = tSmoothTuple[0].D;
+					}
+					tSmoothTuple?.Dispose();
+				}
+				catch
+				{
+					tSmooth = 0.0;
+				}
+
+				HOperatorSet.Difference(templateRegion, edgeMask, out nonEdgeMask);
+				HTuple nMeanTuple;
+				HTuple nDevTuple;
+				HOperatorSet.Intensity(nonEdgeMask, grad, out nMeanTuple, out nDevTuple);
+				double nMean = (nMeanTuple != null && nMeanTuple.Length > 0) ? nMeanTuple[0].D : 0.0;
+				double nDev = (nDevTuple != null && nDevTuple.Length > 0) ? nDevTuple[0].D : 0.0;
+				nMeanTuple?.Dispose();
+				nDevTuple?.Dispose();
+
+				HTuple eMeanTuple;
+				HTuple eDevTuple;
+				HOperatorSet.Intensity(edgeMask, grad, out eMeanTuple, out eDevTuple);
+				double eMean = (eMeanTuple != null && eMeanTuple.Length > 0) ? eMeanTuple[0].D : tMaxSep;
+				eMeanTuple?.Dispose();
+				eDevTuple?.Dispose();
+
+				double noiseFloor = nMean + 3.0 * nDev;
+				double candHigh = Math.Max(tMaxSep, Math.Max(eMean * 0.68, nMean + 4.5 * nDev));
+				if (tSmooth > 0.0 && tSmooth < 120.0 && tSmooth < maxGradient * 0.85)
+				{
+					candHigh = Math.Max(candHigh, tSmooth * 0.95);
+				}
+				double maxAllowedHigh = Math.Min(255.0, Math.Max(3.0, maxGradient * 0.85));
+				highThreshold = Math.Round(Math.Max(3.0, Math.Min(maxAllowedHigh, candHigh)), 1);
+				lowThreshold = Math.Round(Math.Max(1.0, Math.Min(highThreshold - 1.0, Math.Max(highThreshold * 0.42, noiseFloor))), 1);
+			}
+			finally
+			{
+				nonEdgeMask?.Dispose();
+				smoothMask?.Dispose();
+				edgeMask?.Dispose();
+				gradByte?.Dispose();
+				grad?.Dispose();
+			}
+		}
+
+		private static int CountHalconObjects(HObject objects)
+		{
+			if (objects == null)
+			{
+				return 0;
+			}
+			HTuple countTuple;
+			HOperatorSet.CountObj(objects, out countTuple);
+			int count = (countTuple != null && countTuple.Length > 0) ? countTuple[0].I : 0;
+			countTuple?.Dispose();
+			return count;
 		}
 
 		private static List<PointF> ReadFeaturePoints(HObject edges, double minimumDistance, int maximumPoints)
@@ -359,18 +752,20 @@ namespace Seprays.MarkVision
 			{
 				return new List<PointF>();
 			}
-			HOperatorSet.CountObj(edges, out var countTuple);
-			int contourCount = ((countTuple.Length != 0) ? countTuple[0].I : 0);
+			int contourCount = CountHalconObjects(edges);
 			double spacing = Math.Max(1.0, minimumDistance);
 			for (int index = 1; index <= contourCount; index++)
 			{
 				HObject contour = null;
+				HTuple rows = null;
+				HTuple columns = null;
 				try
 				{
 					HOperatorSet.SelectObj(edges, out contour, index);
-					HOperatorSet.GetContourXld(contour, out var rows, out var columns);
-					List<PointF> rawPoints = new List<PointF>(Math.Min(rows.Length, columns.Length));
-					for (int pointIndex = 0; pointIndex < rows.Length && pointIndex < columns.Length; pointIndex++)
+					HOperatorSet.GetContourXld(contour, out rows, out columns);
+					int count = Math.Min(rows.Length, columns.Length);
+					List<PointF> rawPoints = new List<PointF>(count);
+					for (int pointIndex = 0; pointIndex < count; pointIndex++)
 					{
 						rawPoints.Add(new PointF((float)columns[pointIndex].D, (float)rows[pointIndex].D));
 					}
@@ -382,20 +777,24 @@ namespace Seprays.MarkVision
 				}
 				finally
 				{
+					rows?.Dispose();
+					columns?.Dispose();
 					contour?.Dispose();
 				}
 			}
 			int pointLimit = Math.Max(100, maximumPoints);
 			List<PointF> result = new List<PointF>();
 			int realPointCount = 0;
-			foreach (Tuple<List<PointF>, double> item in contours.OrderByDescending((Tuple<List<PointF>, double> tuple) => tuple.Item2))
+			foreach (Tuple<List<PointF>, double> item in contours.OrderByDescending(tuple => tuple.Item2))
 			{
 				int remaining = pointLimit - realPointCount;
 				if (remaining < 2)
 				{
 					break;
 				}
-				List<PointF> points = ((item.Item1.Count <= remaining) ? item.Item1 : ResampleContour(item.Item1, 0.0, remaining));
+				List<PointF> points = item.Item1.Count <= remaining
+					? item.Item1
+					: ResampleContour(item.Item1, 0.0, remaining);
 				if (points.Count >= 2)
 				{
 					if (result.Count > 0)
@@ -425,6 +824,17 @@ namespace Seprays.MarkVision
 				if (minimumDistance <= 0.0 || dx * dx + dy * dy >= distanceSquared)
 				{
 					result.Add(points[index]);
+				}
+			}
+			if (points.Count >= 2 && result.Count > 0)
+			{
+				PointF last = points[points.Count - 1];
+				PointF currentTail = result[result.Count - 1];
+				double tailDx = last.X - currentTail.X;
+				double tailDy = last.Y - currentTail.Y;
+				if (tailDx * tailDx + tailDy * tailDy >= 0.25)
+				{
+					result.Add(last);
 				}
 			}
 			if (result.Count <= maximumPoints)
@@ -462,9 +872,10 @@ namespace Seprays.MarkVision
 		{
 			contours = null;
 			List<PointF> segment = new List<PointF>();
-			for (int index = 0; index <= (points?.Count ?? 0); index++)
+			int count = points?.Count ?? 0;
+			for (int index = 0; index <= count; index++)
 			{
-				if (index != (points?.Count ?? 0) && !IsContourSeparator(points[index]))
+				if (index != count && !IsContourSeparator(points[index]))
 				{
 					segment.Add(points[index]);
 					continue;
@@ -484,13 +895,15 @@ namespace Seprays.MarkVision
 			{
 				return;
 			}
-			HTuple rows = new HTuple();
-			HTuple columns = new HTuple();
+			double[] rowArray = new double[points.Count];
+			double[] colArray = new double[points.Count];
 			for (int index = 0; index < points.Count; index++)
 			{
-				rows = rows.TupleConcat(points[index].Y);
-				columns = columns.TupleConcat(points[index].X);
+				rowArray[index] = points[index].Y;
+				colArray[index] = points[index].X;
 			}
+			HTuple rows = new HTuple(rowArray);
+			HTuple columns = new HTuple(colArray);
 			HObject oneContour = null;
 			HObject concatenated = null;
 			try
@@ -509,22 +922,55 @@ namespace Seprays.MarkVision
 			}
 			finally
 			{
+				rows.Dispose();
+				columns.Dispose();
 				oneContour?.Dispose();
 				concatenated?.Dispose();
 			}
 		}
 
-		private static void SetModelOriginToTemplateCenter(HTuple modelId, IEnumerable<PointF> featurePoints, RectangleF templateRoi)
+		private static void GetXldBoundingCenter(HObject contoursXld, out double centerRow, out double centerCol)
 		{
-			List<PointF> realPoints = (featurePoints ?? Enumerable.Empty<PointF>()).Where((PointF point) => !IsContourSeparator(point)).ToList();
-			if (modelId != null && modelId.Length != 0 && realPoints.Count != 0)
+			HTuple r1 = null;
+			HTuple c1 = null;
+			HTuple r2 = null;
+			HTuple c2 = null;
+			HTuple rMin = null;
+			HTuple cMin = null;
+			HTuple rMax = null;
+			HTuple cMax = null;
+			try
 			{
-				double defaultRow = (double)(realPoints.Min((PointF point) => point.Y) + realPoints.Max((PointF point) => point.Y)) * 0.5;
-				double defaultColumn = (double)(realPoints.Min((PointF point) => point.X) + realPoints.Max((PointF point) => point.X)) * 0.5;
-				double targetRow = (double)templateRoi.Top + (double)templateRoi.Height * 0.5;
-				double targetColumn = (double)templateRoi.Left + (double)templateRoi.Width * 0.5;
-				HOperatorSet.SetShapeModelOrigin(modelId, targetRow - defaultRow, targetColumn - defaultColumn);
+				HOperatorSet.SmallestRectangle1Xld(contoursXld, out r1, out c1, out r2, out c2);
+				HOperatorSet.TupleMin(r1, out rMin);
+				HOperatorSet.TupleMin(c1, out cMin);
+				HOperatorSet.TupleMax(r2, out rMax);
+				HOperatorSet.TupleMax(c2, out cMax);
+				centerRow = (rMin[0].D + rMax[0].D) * 0.5;
+				centerCol = (cMin[0].D + cMax[0].D) * 0.5;
 			}
+			finally
+			{
+				rMin?.Dispose();
+				cMin?.Dispose();
+				rMax?.Dispose();
+				cMax?.Dispose();
+				r1?.Dispose();
+				c1?.Dispose();
+				r2?.Dispose();
+				c2?.Dispose();
+			}
+		}
+
+		private static void SetModelOriginToTemplateCenter(HTuple modelId, double defaultRow, double defaultColumn, RectangleF templateRoi)
+		{
+			if (modelId == null || modelId.Length == 0)
+			{
+				return;
+			}
+			double targetRow = (double)templateRoi.Top + (double)templateRoi.Height * 0.5;
+			double targetColumn = (double)templateRoi.Left + (double)templateRoi.Width * 0.5;
+			HOperatorSet.SetShapeModelOrigin(modelId, targetRow - defaultRow, targetColumn - defaultColumn);
 		}
 
 		private static PointF CreateContourSeparator()
@@ -534,16 +980,12 @@ namespace Seprays.MarkVision
 
 		private static bool IsContourSeparator(PointF point)
 		{
-			if (!float.IsNaN(point.X))
-			{
-				return float.IsNaN(point.Y);
-			}
-			return true;
+			return float.IsNaN(point.X) || float.IsNaN(point.Y);
 		}
 
 		private static int CountRealPoints(IEnumerable<PointF> points)
 		{
-			return points?.Count((PointF point) => !IsContourSeparator(point)) ?? 0;
+			return points?.Count(point => !IsContourSeparator(point)) ?? 0;
 		}
 
 		private static void AppendSeparator(List<PointF> points, ref bool segmentHasPoint)
@@ -574,13 +1016,31 @@ namespace Seprays.MarkVision
 			}
 			else if (shape == RegionShape.Diamond)
 			{
-				HTuple rows = new HTuple();
-				HTuple columns = new HTuple();
-				rows = rows.TupleConcat(bounds.Top).TupleConcat(bounds.Top + bounds.Height * 0.5).TupleConcat(bounds.Bottom).TupleConcat(bounds.Top + bounds.Height * 0.5);
-				columns = columns.TupleConcat(bounds.Left + bounds.Width * 0.5).TupleConcat(bounds.Right).TupleConcat(bounds.Left + bounds.Width * 0.5).TupleConcat(bounds.Left);
-				HOperatorSet.GenRegionPolygon(out region, rows, columns);
-				rows.Dispose();
-				columns.Dispose();
+				double[] rowArray =
+				{
+					bounds.Top,
+					bounds.Top + bounds.Height * 0.5,
+					bounds.Bottom,
+					bounds.Top + bounds.Height * 0.5
+				};
+				double[] colArray =
+				{
+					bounds.Left + bounds.Width * 0.5,
+					bounds.Right,
+					bounds.Left + bounds.Width * 0.5,
+					bounds.Left
+				};
+				HTuple rows = new HTuple(rowArray);
+				HTuple columns = new HTuple(colArray);
+				try
+				{
+					HOperatorSet.GenRegionPolygon(out region, rows, columns);
+				}
+				finally
+				{
+					rows.Dispose();
+					columns.Dispose();
+				}
 			}
 			else
 			{
@@ -588,110 +1048,13 @@ namespace Seprays.MarkVision
 			}
 		}
 
-		private static HObject BuildTemplateDomain(Rectangle templateRect, IEnumerable<MaskStroke> strokes)
-		{
-			HObject bounds = null;
-			HOperatorSet.GenRectangle1(out bounds, 0, 0, templateRect.Height - 1, templateRect.Width - 1);
-			HObject domain = bounds.Clone();
-			bounds.Dispose();
-			foreach (MaskStroke stroke in strokes ?? Enumerable.Empty<MaskStroke>())
-			{
-				if (stroke == null || stroke.GetBounds().IsEmpty)
-				{
-					continue;
-				}
-				HObject brush = null;
-				HObject next = null;
-				HObject clipped = null;
-				try
-				{
-					RectangleF strokeBounds = stroke.GetBounds();
-					RegionShape shape = Enum.IsDefined(typeof(RegionShape), stroke.Shape) ? stroke.Shape : RegionShape.Circle;
-					RectangleF localBounds = new RectangleF(strokeBounds.X - templateRect.Left, strokeBounds.Y - templateRect.Top, strokeBounds.Width, strokeBounds.Height);
-					if (shape == RegionShape.Circle)
-					{
-						HOperatorSet.GenCircle(out brush, localBounds.Top + localBounds.Height * 0.5, localBounds.Left + localBounds.Width * 0.5, localBounds.Width * 0.5);
-					}
-					else if (shape == RegionShape.Diamond)
-					{
-						HTuple rows = new HTuple();
-						HTuple columns = new HTuple();
-						rows = rows.TupleConcat(localBounds.Top).TupleConcat(localBounds.Top + localBounds.Height * 0.5).TupleConcat(localBounds.Bottom).TupleConcat(localBounds.Top + localBounds.Height * 0.5);
-						columns = columns.TupleConcat(localBounds.Left + localBounds.Width * 0.5).TupleConcat(localBounds.Right).TupleConcat(localBounds.Left + localBounds.Width * 0.5).TupleConcat(localBounds.Left);
-						HOperatorSet.GenRegionPolygon(out brush, rows, columns);
-						rows.Dispose();
-						columns.Dispose();
-					}
-					else
-					{
-						HOperatorSet.GenRectangle1(out brush, localBounds.Top, localBounds.Left, localBounds.Bottom - 1, localBounds.Right - 1);
-					}
-					if (stroke.Mode == MaskStrokeMode.Exclude)
-					{
-						HOperatorSet.Difference(domain, brush, out next);
-					}
-					else
-					{
-						HOperatorSet.Union2(domain, brush, out next);
-						HOperatorSet.GenRectangle1(out var clipBounds, 0, 0, templateRect.Height - 1, templateRect.Width - 1);
-						try
-						{
-							HOperatorSet.Intersection(next, clipBounds, out clipped);
-						}
-						finally
-						{
-							clipBounds.Dispose();
-						}
-						next.Dispose();
-						next = clipped;
-						clipped = null;
-					}
-					domain.Dispose();
-					domain = next;
-					next = null;
-				}
-				finally
-				{
-					clipped?.Dispose();
-					next?.Dispose();
-					brush?.Dispose();
-				}
-			}
-			return domain;
-		}
-
 		private static List<List<PointF>> ReadModelContours(HTuple modelId)
 		{
-			List<List<PointF>> result = new List<List<PointF>>();
 			HObject allContours = null;
 			try
 			{
 				HOperatorSet.GetShapeModelContours(out allContours, modelId, 1);
-				HOperatorSet.CountObj(allContours, out var countTuple);
-				int count = ((countTuple.Length != 0) ? countTuple[0].I : 0);
-				for (int index = 1; index <= count; index++)
-				{
-					HObject contour = null;
-					try
-					{
-						HOperatorSet.SelectObj(allContours, out contour, index);
-						HOperatorSet.GetContourXld(contour, out var rows, out var columns);
-						List<PointF> points = new List<PointF>(Math.Min(rows.Length, columns.Length));
-						for (int i = 0; i < rows.Length && i < columns.Length; i++)
-						{
-							points.Add(new PointF((float)columns[i].D, (float)rows[i].D));
-						}
-						if (points.Count > 1)
-						{
-							result.Add(points);
-						}
-					}
-					finally
-					{
-						contour?.Dispose();
-					}
-				}
-				return result;
+				return ReadContoursXld(allContours);
 			}
 			finally
 			{
@@ -699,41 +1062,80 @@ namespace Seprays.MarkVision
 			}
 		}
 
-		private static List<List<PointF>> TransformContours(IEnumerable<List<PointF>> source, double row, double col, double angle, double scale)
+		private static List<List<PointF>> ReadContoursXld(HObject allContours)
 		{
-			double cos = Math.Cos(angle);
-			double sin = Math.Sin(angle);
 			List<List<PointF>> result = new List<List<PointF>>();
-			foreach (List<PointF> item in source ?? Enumerable.Empty<List<PointF>>())
+			if (allContours == null)
 			{
-				List<PointF> list = item;
-				List<PointF> transformed = new List<PointF>();
-				if (list == null)
+				return result;
+			}
+			int count = CountHalconObjects(allContours);
+			for (int index = 1; index <= count; index++)
+			{
+				HObject contour = null;
+				HTuple rows = null;
+				HTuple columns = null;
+				try
 				{
-					list = new List<PointF>();
+					HOperatorSet.SelectObj(allContours, out contour, index);
+					HOperatorSet.GetContourXld(contour, out rows, out columns);
+					int len = Math.Min(rows.Length, columns.Length);
+					List<PointF> points = new List<PointF>(len);
+					for (int i = 0; i < len; i++)
+					{
+						points.Add(new PointF((float)columns[i].D, (float)rows[i].D));
+					}
+					if (points.Count > 1)
+					{
+						result.Add(points);
+					}
 				}
-				foreach (PointF point in list)
+				finally
 				{
-					double x = (double)point.X * scale;
-					double y = (double)point.Y * scale;
-					transformed.Add(new PointF((float)(col + x * cos + y * sin), (float)(row - x * sin + y * cos)));
-				}
-				if (transformed.Count > 1)
-				{
-					result.Add(transformed);
+					rows?.Dispose();
+					columns?.Dispose();
+					contour?.Dispose();
 				}
 			}
 			return result;
 		}
 
-		private static void ApplyCircleRefinement(Bitmap source, RectangleF templateRoi, MarkMatchParameters parameters, MarkLocateResult result)
+		private static List<List<PointF>> TransformContoursWithHalcon(IEnumerable<List<PointF>> source, double row, double col, double angle, double scale)
+		{
+			HObject modelContours = null;
+			HObject transformedContours = null;
+			HTuple rigid = null;
+			HTuple scaled = null;
+			try
+			{
+				foreach (List<PointF> contour in source ?? Enumerable.Empty<List<PointF>>())
+				{
+					AppendContourSegment(contour, ref modelContours);
+				}
+				if (modelContours == null)
+				{
+					return new List<List<PointF>>();
+				}
+				HOperatorSet.VectorAngleToRigid(0.0, 0.0, 0.0, row, col, angle, out rigid);
+				HOperatorSet.HomMat2dScaleLocal(rigid, scale, scale, out scaled);
+				HOperatorSet.AffineTransContourXld(modelContours, out transformedContours, scaled);
+				return ReadContoursXld(transformedContours);
+			}
+			finally
+			{
+				scaled?.Dispose();
+				rigid?.Dispose();
+				transformedContours?.Dispose();
+				modelContours?.Dispose();
+			}
+		}
+
+		private static void ApplyCircleRefinement(HObject grayImage, Size imageSize, RectangleF templateRoi, MarkMatchParameters parameters, MarkLocateResult result)
 		{
 			if (!parameters.EnableCircleRefinement)
 			{
 				return;
 			}
-			PointF center;
-			float radius;
 			double expectedRadius = parameters.ExpectedCircleRadius;
 			if (expectedRadius <= 1.0 && !templateRoi.IsEmpty)
 			{
@@ -746,8 +1148,11 @@ namespace Seprays.MarkVision
 					result.Success = false;
 					result.Message = "形状模板已匹配，但圆心精修缺少示教圆半径。";
 				}
+				return;
 			}
-			else if (TryRefineCircle(source, result.ModelPoint, expectedRadius * result.Scale, parameters, out center, out radius))
+			PointF center;
+			float radius;
+			if (TryRefineCircleHalcon(grayImage, imageSize, result.ModelPoint, expectedRadius * result.Scale, parameters, out center, out radius))
 			{
 				result.CircleFound = true;
 				result.CirclePoint = center;
@@ -770,182 +1175,442 @@ namespace Seprays.MarkVision
 			}
 		}
 
-		private static bool TryRefineCircle(Bitmap source, PointF initialCenter, double expectedRadius, MarkMatchParameters parameters, out PointF center, out float radius)
+		private static bool TryRefineCircleHalcon(HObject grayImage, Size imageSize, PointF initialCenter, double expectedRadius, MarkMatchParameters parameters, out PointF center, out float radius)
 		{
 			center = initialCenter;
 			radius = (float)expectedRadius;
-			byte[] gray = ReadGrayBytes(source);
-			int width = source.Width;
-			int height = source.Height;
-			int spokeCount = parameters.CircleSpokeCount;
-			double minRadius = expectedRadius * (1.0 - parameters.CircleRadialTolerance);
-			double maxRadius = expectedRadius * (1.0 + parameters.CircleRadialTolerance);
-			List<PointF> edgePoints = new List<PointF>(spokeCount);
-			for (int index = 0; index < spokeCount; index++)
-			{
-				double num = Math.PI * 2.0 * (double)index / (double)spokeCount;
-				double dx = Math.Cos(num);
-				double dy = Math.Sin(num);
-				double bestGradient = double.MinValue;
-				double bestRadius = 0.0;
-				for (double sampleRadius = minRadius; sampleRadius <= maxRadius; sampleRadius += 0.75)
-				{
-					double inner = SampleGray(gray, width, height, (double)initialCenter.X + dx * (sampleRadius - 1.25), (double)initialCenter.Y + dy * (sampleRadius - 1.25));
-					double outer = SampleGray(gray, width, height, (double)initialCenter.X + dx * (sampleRadius + 1.25), (double)initialCenter.Y + dy * (sampleRadius + 1.25));
-					if (!double.IsNaN(inner) && !double.IsNaN(outer))
-					{
-						double gradient = Math.Abs(inner - outer);
-						if (gradient > bestGradient)
-						{
-							bestGradient = gradient;
-							bestRadius = sampleRadius;
-						}
-					}
-				}
-				if (bestGradient >= parameters.CircleEdgeThreshold)
-				{
-					edgePoints.Add(new PointF((float)((double)initialCenter.X + dx * bestRadius), (float)((double)initialCenter.Y + dy * bestRadius)));
-				}
-			}
-			int requiredPoints = Math.Max(12, (int)Math.Ceiling((double)spokeCount * 0.35));
-			if (edgePoints.Count < requiredPoints || !FitCircle(edgePoints, out var firstCenter, out var firstRadius))
+			if (expectedRadius <= 1.0 || !IsFinite(initialCenter))
 			{
 				return false;
 			}
-			double residualLimit = Math.Max(2.0, expectedRadius * 0.08);
-			List<PointF> inliers = edgePoints.Where((PointF point) => Math.Abs(Distance(point, firstCenter) - firstRadius) <= residualLimit).ToList();
-			if (inliers.Count < requiredPoints || !FitCircle(inliers, out var refinedCenter, out var refinedRadius))
+			double threshold = parameters.CircleEdgeThreshold;
+			if (TryRunMetrologyCircle(grayImage, imageSize, initialCenter, expectedRadius, threshold, parameters, out center, out radius))
 			{
-				return false;
+				return true;
 			}
-			double num2 = Math.Abs(refinedRadius - expectedRadius) / expectedRadius;
-			double centerShift = Distance(refinedCenter, initialCenter);
-			// A circle center can legitimately move relative to the shape-model origin.
-			// The shape match is already valid at this point; do not turn a usable match
-			// into a failure only because the optional circle refinement moved farther.
-			if (num2 > parameters.CircleRadialTolerance)
+			if (parameters.AutoEdgeThreshold && threshold > 3.5)
 			{
-				return false;
-			}
-			center = refinedCenter;
-			radius = (float)refinedRadius;
-			return true;
-		}
-
-		private static bool FitCircle(IList<PointF> points, out PointF center, out double radius)
-		{
-			center = PointF.Empty;
-			radius = 0.0;
-			if (points == null || points.Count < 3)
-			{
-				return false;
-			}
-			double meanX = ((IEnumerable<PointF>)points).Average((Func<PointF, double>)((PointF pointF) => pointF.X));
-			double meanY = ((IEnumerable<PointF>)points).Average((Func<PointF, double>)((PointF pointF) => pointF.Y));
-			double suu = 0.0;
-			double suv = 0.0;
-			double svv = 0.0;
-			double suz = 0.0;
-			double svz = 0.0;
-			double meanZ = 0.0;
-			foreach (PointF point in points)
-			{
-				double u = (double)point.X - meanX;
-				double v = (double)point.Y - meanY;
-				double z = u * u + v * v;
-				suu += u * u;
-				suv += u * v;
-				svv += v * v;
-				suz += u * z;
-				svz += v * z;
-				meanZ += z;
-			}
-			double determinant = suu * svv - suv * suv;
-			if (Math.Abs(determinant) < 1E-09)
-			{
-				return false;
-			}
-			double uc = 0.5 * (suz * svv - svz * suv) / determinant;
-			double vc = 0.5 * (svz * suu - suz * suv) / determinant;
-			double fittedRadiusSquared = uc * uc + vc * vc + meanZ / (double)points.Count;
-			if (fittedRadiusSquared <= 0.0)
-			{
-				return false;
-			}
-			center = new PointF((float)(meanX + uc), (float)(meanY + vc));
-			radius = Math.Sqrt(fittedRadiusSquared);
-			if (!double.IsNaN(radius))
-			{
-				return !double.IsInfinity(radius);
+				double relaxedThreshold = Math.Max(3.0, threshold * 0.5);
+				return TryRunMetrologyCircle(grayImage, imageSize, initialCenter, expectedRadius, relaxedThreshold, parameters, out center, out radius);
 			}
 			return false;
 		}
 
-		private static byte[] ReadGrayBytes(Bitmap source)
+		private static bool TryRunMetrologyCircle(HObject grayImage, Size imageSize, PointF initialCenter, double expectedRadius, double measureThreshold, MarkMatchParameters parameters, out PointF center, out float radius)
 		{
-			int width = source.Width;
-			int height = source.Height;
-			byte[] gray = new byte[width * height];
-			using (Bitmap converted = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+			center = initialCenter;
+			radius = (float)expectedRadius;
+			HTuple metrologyHandle = null;
+			HTuple index = null;
+			HTuple paramNames = null;
+			HTuple paramValues = null;
+			HTuple resultTypes = null;
+			HTuple resultValues = null;
+			try
 			{
-				using (Graphics graphics = Graphics.FromImage(converted))
+				HOperatorSet.CreateMetrologyModel(out metrologyHandle);
+				HOperatorSet.SetMetrologyModelImageSize(metrologyHandle, imageSize.Width, imageSize.Height);
+				double measureLength1 = Math.Max(4.0, expectedRadius * parameters.CircleRadialTolerance);
+				double measureLength2 = Math.Max(1.5, Math.Min(4.0, expectedRadius * 0.08));
+				paramNames = new HTuple(new[] { "num_measures", "min_score", "measure_transition", "measure_select" });
+				paramValues = new HTuple(parameters.CircleSpokeCount)
+					.TupleConcat(0.35)
+					.TupleConcat("all")
+					.TupleConcat("all");
+				HOperatorSet.AddMetrologyObjectCircleMeasure(
+					metrologyHandle,
+					(double)initialCenter.Y,
+					(double)initialCenter.X,
+					expectedRadius,
+					measureLength1,
+					measureLength2,
+					1.2,
+					measureThreshold,
+					paramNames,
+					paramValues,
+					out index);
+				HOperatorSet.ApplyMetrologyModel(grayImage, metrologyHandle);
+				resultTypes = new HTuple(new[] { "row", "column", "radius" });
+				HOperatorSet.GetMetrologyObjectResult(metrologyHandle, index, "all", "result_type", resultTypes, out resultValues);
+				if (resultValues == null || resultValues.Length < 3)
 				{
-					graphics.DrawImageUnscaled(source, 0, 0);
+					return false;
 				}
-				BitmapData data = converted.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+				double fittedRow = resultValues[0].D;
+				double fittedCol = resultValues[1].D;
+				double fittedRadius = resultValues[2].D;
+				if (double.IsNaN(fittedRadius) || double.IsInfinity(fittedRadius) || fittedRadius <= 1.0)
+				{
+					return false;
+				}
+				if (Math.Abs(fittedRadius - expectedRadius) / expectedRadius > parameters.CircleRadialTolerance)
+				{
+					return false;
+				}
+				center = new PointF((float)fittedCol, (float)fittedRow);
+				radius = (float)fittedRadius;
+				return true;
+			}
+			catch
+			{
+				return false;
+			}
+			finally
+			{
+				resultValues?.Dispose();
+				resultTypes?.Dispose();
+				paramValues?.Dispose();
+				paramNames?.Dispose();
+				index?.Dispose();
+				if (metrologyHandle != null && metrologyHandle.Length > 0)
+				{
+					try
+					{
+						HOperatorSet.ClearMetrologyModel(metrologyHandle);
+					}
+					catch
+					{
+					}
+					metrologyHandle.Dispose();
+				}
+			}
+		}
+
+		private static bool TryDetectCircleByEdgesHalcon(HObject grayImage, RectangleF roi, Size imageSize, MarkMatchParameters parameters, out PointF center, out float radius)
+		{
+			center = PointF.Empty;
+			radius = 0f;
+			Rectangle rect = ToPixelRectangle(roi, imageSize);
+			if (rect.Width < 16 || rect.Height < 16)
+			{
+				return false;
+			}
+			HObject roiRegion = null;
+			HObject reduced = null;
+			HObject edges = null;
+			HObject selected = null;
+			HTuple rowTuple = null;
+			HTuple colTuple = null;
+			HTuple radTuple = null;
+			HTuple sp = null;
+			HTuple ep = null;
+			HTuple po = null;
+			try
+			{
+				HOperatorSet.GenRectangle1(out roiRegion, rect.Top, rect.Left, rect.Bottom - 1, rect.Right - 1);
+				HOperatorSet.ReduceDomain(grayImage, roiRegion, out reduced);
+				double low = parameters.EdgeLowThreshold;
+				double high = parameters.EdgeHighThreshold;
+				if (parameters.AutoEdgeThreshold)
+				{
+					double maxGrad;
+					EstimateAutoEdgeThresholds(reduced, roiRegion, parameters.EdgeSigma, out low, out high, out maxGrad);
+				}
+				HOperatorSet.EdgesSubPix(reduced, out edges, "canny", parameters.EdgeSigma, low, high);
+				HOperatorSet.SelectShapeXld(edges, out selected, "circularity", "and", 0.65, 1.0);
+				if (CountHalconObjects(selected) == 0)
+				{
+					return false;
+				}
+				HOperatorSet.FitCircleContourXld(selected, "geotukey", -1, 0, 0, 3, 2.0, out rowTuple, out colTuple, out radTuple, out sp, out ep, out po);
+				if (rowTuple == null || rowTuple.Length == 0)
+				{
+					return false;
+				}
+				int bestIndex = -1;
+				double bestRadius = 0.0;
+				double maxPossibleRadius = Math.Min(rect.Width, rect.Height) * 0.55;
+				for (int i = 0; i < radTuple.Length; i++)
+				{
+					double r = radTuple[i].D;
+					if (r >= 4.0 && r <= maxPossibleRadius && r > bestRadius)
+					{
+						bestRadius = r;
+						bestIndex = i;
+					}
+				}
+				if (bestIndex < 0)
+				{
+					return false;
+				}
+				center = new PointF((float)colTuple[bestIndex].D, (float)rowTuple[bestIndex].D);
+				radius = (float)bestRadius;
+				return true;
+			}
+			catch
+			{
+				return false;
+			}
+			finally
+			{
+				po?.Dispose();
+				ep?.Dispose();
+				sp?.Dispose();
+				radTuple?.Dispose();
+				colTuple?.Dispose();
+				rowTuple?.Dispose();
+				selected?.Dispose();
+				edges?.Dispose();
+				reduced?.Dispose();
+				roiRegion?.Dispose();
+			}
+		}
+
+		private static List<List<PointF>> CreateCircleContourPoints(PointF center, float radius)
+		{
+			HObject circle = null;
+			try
+			{
+				HOperatorSet.GenCircleContourXld(out circle, (double)center.Y, (double)center.X, (double)radius, 0.0, Math.PI * 2.0, "positive", 1.5);
+				return ReadContoursXld(circle);
+			}
+			finally
+			{
+				circle?.Dispose();
+			}
+		}
+
+		private static void BuildCrossXld(PointF center, double halfSize, out HObject crossContours)
+		{
+			crossContours = null;
+			List<PointF> points = new List<PointF>
+			{
+				new PointF((float)(center.X - halfSize), center.Y),
+				new PointF((float)(center.X + halfSize), center.Y),
+				CreateContourSeparator(),
+				new PointF(center.X, (float)(center.Y - halfSize)),
+				new PointF(center.X, (float)(center.Y + halfSize))
+			};
+			GenContoursFromFeaturePoints(points, out crossContours);
+		}
+
+		private static void PaintXldStep(ref HObject rgbImage, HObject xld, int r, int g, int b)
+		{
+			if (xld == null)
+			{
+				return;
+			}
+			HTuple color = new HTuple(new[] { r, g, b });
+			HObject next = null;
+			try
+			{
+				HOperatorSet.PaintXld(xld, rgbImage, out next, color);
+				rgbImage.Dispose();
+				rgbImage = next;
+				next = null;
+			}
+			finally
+			{
+				color.Dispose();
+				next?.Dispose();
+			}
+		}
+
+		private static HObject ConvertBitmapToHalconGray(Bitmap source)
+		{
+			return ConvertBitmapRegionToHalconGray(source, new Rectangle(0, 0, source.Width, source.Height));
+		}
+
+		private static HObject ConvertBitmapRegionToHalconGray(Bitmap source, Rectangle region)
+		{
+			Rectangle clipped = Rectangle.Intersect(region, new Rectangle(0, 0, source.Width, source.Height));
+			if (source.PixelFormat == PixelFormat.Format8bppIndexed && IsIdentityGrayscalePalette(source))
+			{
+				return CreateGrayImageFrom8bpp(source, clipped);
+			}
+			HObject rgb = ConvertBitmapRegionToHalconRgb(source, clipped);
+			try
+			{
+				HObject gray;
+				HOperatorSet.Rgb1ToGray(rgb, out gray);
+				return gray;
+			}
+			finally
+			{
+				rgb.Dispose();
+			}
+		}
+
+		private static HObject ConvertBitmapToHalconRgb(Bitmap source)
+		{
+			return ConvertBitmapRegionToHalconRgb(source, new Rectangle(0, 0, source.Width, source.Height));
+		}
+
+		private static HObject ConvertBitmapRegionToHalconRgb(Bitmap source, Rectangle region)
+		{
+			if (source.PixelFormat == PixelFormat.Format8bppIndexed && IsIdentityGrayscalePalette(source))
+			{
+				HObject gray = CreateGrayImageFrom8bpp(source, region);
 				try
 				{
-					int stride = Math.Abs(data.Stride);
-					byte[] rgb = new byte[stride * height];
-					Marshal.Copy(data.Scan0, rgb, 0, rgb.Length);
-					for (int y = 0; y < height; y++)
-					{
-						int sourceRow = ((data.Stride < 0) ? ((height - 1 - y) * stride) : (y * stride));
-						int targetRow = y * width;
-						for (int x = 0; x < width; x++)
-						{
-							int offset = sourceRow + x * 3;
-							gray[targetRow + x] = (byte)(0.114 * (double)(int)rgb[offset] + 0.587 * (double)(int)rgb[offset + 1] + 0.299 * (double)(int)rgb[offset + 2]);
-						}
-					}
+					HObject composed;
+					HOperatorSet.Compose3(gray, gray, gray, out composed);
+					return composed;
+				}
+				finally
+				{
+					gray.Dispose();
+				}
+			}
+			if (source.PixelFormat == PixelFormat.Format24bppRgb)
+			{
+				return CreateRgbFrom24bpp(source, region);
+			}
+			if (source.PixelFormat == PixelFormat.Format32bppRgb ||
+				source.PixelFormat == PixelFormat.Format32bppArgb ||
+				source.PixelFormat == PixelFormat.Format32bppPArgb)
+			{
+				return CreateRgbFrom32bpp(source, region);
+			}
+			using (Bitmap converted = source.Clone(region, PixelFormat.Format32bppRgb))
+			{
+				return CreateRgbFrom32bpp(converted, new Rectangle(0, 0, converted.Width, converted.Height));
+			}
+		}
+
+		private static HObject CreateGrayImageFrom8bpp(Bitmap source, Rectangle region)
+		{
+			int width = region.Width;
+			int height = region.Height;
+			BitmapData data = source.LockBits(region, ImageLockMode.ReadOnly, PixelFormat.Format8bppIndexed);
+			try
+			{
+				if (width == source.Width && data.Stride == width)
+				{
+					HObject gray;
+					HOperatorSet.GenImage1(out gray, "byte", width, height, data.Scan0);
+					return gray;
+				}
+				byte[] packed = PackRows(data.Scan0, data.Stride, width, height);
+				GCHandle handle = GCHandle.Alloc(packed, GCHandleType.Pinned);
+				try
+				{
+					HObject gray;
+					HOperatorSet.GenImage1(out gray, "byte", width, height, handle.AddrOfPinnedObject());
 					return gray;
 				}
 				finally
 				{
-					converted.UnlockBits(data);
+					handle.Free();
 				}
 			}
-		}
-
-		private static double SampleGray(byte[] gray, int width, int height, double x, double y)
-		{
-			int x2 = (int)Math.Floor(x);
-			int y2 = (int)Math.Floor(y);
-			if (x2 < 0 || y2 < 0 || x2 + 1 >= width || y2 + 1 >= height)
+			finally
 			{
-				return double.NaN;
+				source.UnlockBits(data);
 			}
-			double fx = x - (double)x2;
-			double fy = y - (double)y2;
-			double num = (double)(int)gray[y2 * width + x2] * (1.0 - fx) + (double)(int)gray[y2 * width + x2 + 1] * fx;
-			double bottom = (double)(int)gray[(y2 + 1) * width + x2] * (1.0 - fx) + (double)(int)gray[(y2 + 1) * width + x2 + 1] * fx;
-			return num * (1.0 - fy) + bottom * fy;
 		}
 
-		private static double Distance(PointF first, PointF second)
+		private static HObject CreateRgbFrom24bpp(Bitmap source, Rectangle region)
 		{
-			double num = first.X - second.X;
-			double dy = first.Y - second.Y;
-			return Math.Sqrt(num * num + dy * dy);
+			int width = region.Width;
+			int height = region.Height;
+			BitmapData data = source.LockBits(region, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+			try
+			{
+				int rowBytes = width * 3;
+				if (width == source.Width && data.Stride == rowBytes)
+				{
+					HObject rgb;
+					HOperatorSet.GenImageInterleaved(out rgb, data.Scan0, "bgr", width, height, -1, "byte", width, height, 0, 0, 8, 0);
+					return rgb;
+				}
+				byte[] packed = PackRows(data.Scan0, data.Stride, rowBytes, height);
+				GCHandle handle = GCHandle.Alloc(packed, GCHandleType.Pinned);
+				try
+				{
+					HObject rgb;
+					HOperatorSet.GenImageInterleaved(out rgb, handle.AddrOfPinnedObject(), "bgr", width, height, -1, "byte", width, height, 0, 0, 8, 0);
+					return rgb;
+				}
+				finally
+				{
+					handle.Free();
+				}
+			}
+			finally
+			{
+				source.UnlockBits(data);
+			}
+		}
+
+		private static HObject CreateRgbFrom32bpp(Bitmap source, Rectangle region)
+		{
+			int width = region.Width;
+			int height = region.Height;
+			BitmapData data = source.LockBits(region, ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+			try
+			{
+				int rowBytes = width * 4;
+				if (width == source.Width && data.Stride == rowBytes)
+				{
+					HObject rgb;
+					HOperatorSet.GenImageInterleaved(out rgb, data.Scan0, "bgrx", width, height, -1, "byte", width, height, 0, 0, 8, 0);
+					return rgb;
+				}
+				byte[] packed = PackRows(data.Scan0, data.Stride, rowBytes, height);
+				GCHandle handle = GCHandle.Alloc(packed, GCHandleType.Pinned);
+				try
+				{
+					HObject rgb;
+					HOperatorSet.GenImageInterleaved(out rgb, handle.AddrOfPinnedObject(), "bgrx", width, height, -1, "byte", width, height, 0, 0, 8, 0);
+					return rgb;
+				}
+				finally
+				{
+					handle.Free();
+				}
+			}
+			finally
+			{
+				source.UnlockBits(data);
+			}
+		}
+
+		private static byte[] PackRows(IntPtr scan0, int stride, int rowBytes, int height)
+		{
+			byte[] packed = new byte[rowBytes * height];
+			int absStride = Math.Abs(stride);
+			for (int y = 0; y < height; y++)
+			{
+				int sourceIndex = stride < 0 ? (height - 1 - y) * absStride : y * absStride;
+				Marshal.Copy(IntPtr.Add(scan0, sourceIndex), packed, y * rowBytes, rowBytes);
+			}
+			return packed;
+		}
+
+		private static bool IsIdentityGrayscalePalette(Bitmap source)
+		{
+			Color[] entries = source.Palette?.Entries;
+			if (entries == null || entries.Length < 256)
+			{
+				return false;
+			}
+			for (int i = 0; i < 256; i++)
+			{
+				Color c = entries[i];
+				if (c.R != i || c.G != i || c.B != i)
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		private static bool IsFinite(PointF point)
+		{
+			return !float.IsNaN(point.X) && !float.IsInfinity(point.X) &&
+				!float.IsNaN(point.Y) && !float.IsInfinity(point.Y);
 		}
 
 		private static byte[] ExportShapeModel(HTuple modelId)
 		{
 			HTuple serialized = null;
+			HTuple pointer = null;
+			HTuple size = null;
 			try
 			{
 				HOperatorSet.SerializeShapeModel(modelId, out serialized);
-				HOperatorSet.GetSerializedItemPtr(serialized, out var pointer, out var size);
+				HOperatorSet.GetSerializedItemPtr(serialized, out pointer, out size);
 				int length = size[0].I;
 				byte[] bytes = new byte[length];
 				Marshal.Copy((IntPtr)pointer[0].L, bytes, 0, length);
@@ -953,6 +1618,8 @@ namespace Seprays.MarkVision
 			}
 			finally
 			{
+				size?.Dispose();
+				pointer?.Dispose();
 				ClearSerializedItem(serialized);
 			}
 		}
@@ -965,7 +1632,8 @@ namespace Seprays.MarkVision
 			{
 				handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
 				HOperatorSet.CreateSerializedItemPtr(handle.AddrOfPinnedObject(), bytes.Length, "true", out serialized);
-				HOperatorSet.DeserializeShapeModel(serialized, out var modelId);
+				HTuple modelId;
+				HOperatorSet.DeserializeShapeModel(serialized, out modelId);
 				return modelId;
 			}
 			finally
@@ -991,6 +1659,7 @@ namespace Seprays.MarkVision
 			catch
 			{
 			}
+			modelId.Dispose();
 		}
 
 		private static void ClearSerializedItem(HTuple item)
@@ -1006,15 +1675,16 @@ namespace Seprays.MarkVision
 			catch
 			{
 			}
+			item.Dispose();
 		}
 
 		private static Rectangle ToPixelRectangle(RectangleF roi, Size imageSize)
 		{
-			int num = Math.Max(0, Math.Min(imageSize.Width - 1, (int)Math.Floor(roi.Left)));
+			int left = Math.Max(0, Math.Min(imageSize.Width - 1, (int)Math.Floor(roi.Left)));
 			int top = Math.Max(0, Math.Min(imageSize.Height - 1, (int)Math.Floor(roi.Top)));
-			int right = Math.Max(num + 1, Math.Min(imageSize.Width, (int)Math.Ceiling(roi.Right)));
+			int right = Math.Max(left + 1, Math.Min(imageSize.Width, (int)Math.Ceiling(roi.Right)));
 			int bottom = Math.Max(top + 1, Math.Min(imageSize.Height, (int)Math.Ceiling(roi.Bottom)));
-			return Rectangle.FromLTRB(num, top, right, bottom);
+			return Rectangle.FromLTRB(left, top, right, bottom);
 		}
 
 		private static double DegreesToRadians(double degrees)
